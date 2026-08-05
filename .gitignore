@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# 运行时产物
+output/
+*.csv
+*.log
+
+# 侦察缓存（保留目录结构，忽略大体积二进制）
+js_release_cache/
