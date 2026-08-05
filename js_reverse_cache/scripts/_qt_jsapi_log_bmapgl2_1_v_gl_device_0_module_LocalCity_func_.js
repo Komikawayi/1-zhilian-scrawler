@@ -1,0 +1,1 @@
+/**/BMapGL.logCbk7976478500 && BMapGL.logCbk7976478500({"result":{"error":0}})

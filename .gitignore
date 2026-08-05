@@ -11,8 +11,11 @@ venv/
 
 # 运行时产物
 output/
-*.csv
 *.log
 
-# 侦察缓存（保留目录结构，忽略大体积二进制）
-js_release_cache/
+# 侦察缓存: 保留 HTML/JS/网络样本 (artifact), 忽略敏感 cookie 快照
+js_reverse_cache/network/state_snapshot.json
+js_reverse_cache/*.png
+
+# pytest
+.pytest_cache/
