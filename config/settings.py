@@ -17,4 +17,3 @@ CITY_CODES = {
 }
 
 DEFAULT_CITY = "530"
-DEFAULT_PAGE_SIZE = 20  # 每页职位数 (服务端 SSR 固定 20)

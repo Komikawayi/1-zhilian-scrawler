@@ -57,6 +57,35 @@ class ZhilianClient:
             time.sleep(wait - elapsed)
         self._last_request_at = time.monotonic()
 
+    def get(
+        self,
+        url: str,
+        *,
+        headers: Optional[dict] = None,
+        params: Optional[dict] = None,
+        cookies: Optional[dict] = None,
+        allow_redirects: bool = True,
+    ) -> cffi_requests.Response:
+        """
+        统一限速 + 请求的公开入口 (供采集模块调用, 不暴露 session/私有字段)。
+
+        Args:
+            url: 请求 URL
+            headers: 附加请求头 (与 BASE_HEADERS 合并)
+            params: 查询参数
+            cookies: 请求附加 cookie
+            allow_redirects: 是否跟随重定向
+        """
+        self._throttle()
+        return self.session.get(
+            url,
+            headers=headers,
+            params=params,
+            cookies=cookies,
+            allow_redirects=allow_redirects,
+            timeout=self.timeout,
+        )
+
     def fetch_search_page(self, keyword: str, city: str, page: int = 1) -> str:
         """
         抓取搜索页 SSR HTML。

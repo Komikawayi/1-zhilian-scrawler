@@ -1,85 +1,193 @@
-# 1-zhilian-scrawler
+# zhilian no-proxy crawler
 
-智联招聘（zhaopin.com）搜索接口签名算法还原 + **纯协议 Python 采集器**（已跑通）。
+智联招聘逆向爬虫：搜索 SSR + 职位详情**纯协议**采集。
+核心成果是完整破解腾讯 EdgeOne 职位详情页 **JS Challenge**（91-opcode 字节码 VM 本地执行算
+`EO-Bot-Js-Token`），并摸清 TCaptcha TDC 兜底验证码链（`cap_union_prehandle` / `tdc.js` / POW）。
 
-## 逆向分析结论
+详情页挑战求解需 Node.js；采集全流程不依赖浏览器。侦察素材在 `js_reverse_cache/`，深度分析见
+`docs/zhilian-edgeone-reverse-analysis.md`。
 
-### 真实请求路径 (Phase 1)
+## 当前协议边界（逆向核心结论）
 
-```
-sou.zhaopin.com/?jl=530&kw=python&p=1
-   │  EdgeOne 校验 TLS/HTTP2 指纹
-   ▼  302 重定向 (服务端完成 kw 编码)
-www.zhaopin.com/sou/jl530/kw01O00U80EG06G03F01N0/p1
-   │  SSR HTML (__INITIAL_STATE__.positionList 含 20 条职位)
-   ▼
-纯 HTML 解析即可取数, 无需额外 JSON 接口
-```
+### 防线逆向状态
 
-### 关键防线与结论 (Phase 2/3/4)
-
-| 项 | 发现 | 结论 |
+| 层 | 目标 | 状态 |
 |----|------|------|
-| **访问门控** | 腾讯云 **EdgeOne** Bot 验证（`Security Verification` 页，含 `TencentEOCaptchaWidget`） | 判断依据是 **TLS/HTTP2 指纹 (JA3/JA4)**，非 cookie。注入浏览器 cookie 仍被拦截 |
-| **kw 编码** | `python→01O00U80EG06G03F01N0`, `java→01L00O80EO062`（确定性、会话间稳定） | 编码在 **服务端 302 Location** 完成，客户端跟随重定向即可，**无需自己实现** |
-| **数据来源** | 职位列表在 SSR HTML 的 `__INITIAL_STATE__` 内联 JSON | 直接解析，不依赖 `fe-api` |
-| **fe-api 动态参数** | `_v`, `x-zp-page-request-id`, `x-zp-client-id` | 是 `fe-api.zhaopin.com/c/i/*` 请求参数（筛选配置接口用），本方案不依赖 |
-| **瑞数 cookie** | `FSSBBIl1UgzbN7NO/NS/NT` 存在但非访问门槛 | 浏览器直接访问也无需 EO-Bot-Captcha-Token；requests 无 cookie 被拦是因 TLS 指纹 |
-| **绕过手段** | `curl_cffi` `impersonate="chrome"` 模拟 Chrome TLS 指纹 | **唯一且充分的绕过**（已验证多关键词/多城市/翻页） |
+| ① 搜索访问门控 | EdgeOne TLS/HTTP2 指纹 (JA3/JA4) | ✅ 已破（`curl_cffi impersonate=chrome`）|
+| ② 详情页主防线 | `EO-Bot-Js-Token`（91-opcode VM，29KB 挑战壳）| ✅ 已破（Node vm 求解，无需解混淆）|
+| ②' 详情数据 | **`position-detailv2` JSON API（纯协议无挑战）** | ✅ **首选路径**（20/20 实测）|
+| ③ 详情页兜底 | TCaptcha TDC（`cap_union_prehandle`/`tdc.js`/POW/`new_verify`）| 🔬 已摸清（源码级；待触发时捕获同轮证据）|
+| ④ fe-api 动态参数 | `_v` / `x-zp-page-request-id` / `x-zp-client-id` | ✅ 非签名（随机/无参/真实参都 200）|
 
-### 采集器方案
+### 关键结论（实测）
 
-**纯 Python**（`curl_cffi` + SSR HTML 解析），无需 JS helper、无需浏览器。
+- **搜索** `sou.zhaopin.com`：EdgeOne 按 TLS/HTTP2 指纹放行，`curl_cffi chrome` 直接过，302 后取 SSR
+  `__INITIAL_STATE__.positionList`（20 条/页）。kw 编码在服务端完成，客户端无需自实现。
+  多关键词/多城市/翻页 positionCount 稳定。
+- **职位详情（推荐）** `position-detailv2` JSON API：`number` 用搜索页 `positionList.number`，
+  纯协议直接拿 `{ detailedPosition(67字段), detailedCompany(22字段), taskId }`，**20/20 稳定、
+  0 挑战、0 验证码、无 IP 信誉依赖**，`jobDesc` 完整。比 SSR 快（5KB vs 1.7MB）、无 Node 依赖。
+- **职位详情（兜底）** `www.zhaopin.com/jobdetail/<id>.htm` SSR：无 cookie 首跳稳定返回 **29KB JS Challenge 壳**。
+  内联 script 含 91-opcode VM + SHA 常量，执行后定义 `window.solveChallenge(challenge, seed)`，
+  Node vm 沙箱直接执行得 token（`local#...`，683 字符，max-age 3600s），带 cookie 重放拿到
+  `__INITIAL_STATE__.jobDetail`。**依赖 IP 信誉**——IP 被标记时验证码放行绑定浏览器指纹，纯协议无法绕过。
+- **fe-api** `fe-api.zhaopin.com/c/i/*`：纯协议可调，无需签名。`search/base/data`（2.07MB 筛选字典）、
+  `city-page/user-city`、`experiment/config/initialize`、`jobs/position-detailv2`、`jobs/qrcode`、
+  `user/unread-message`。
+- **真实瓶颈是 IP 信誉，不是逆向算法**：EdgeOne 按 IP 信誉分级——直接放行 → JS Challenge（可本地解）→
+  交互验证码（`Security Verification`）。curl_cffi Chrome 指纹信誉稳（高频 15 次/0.4s 也不升级）；
+  requests 无指纹在信誉差时首跳直接交互验证码。被升级后冷却 5-30 分钟恢复。
+
+### 正确使用姿势
 
 ```
-python main.py --kw python,java --jl 530 --pages 3
+详情采集:   搜索拿 number → position-detailv2 (纯协议, 无需挑战/Node/验证码)
+SSR 兜底:   --detail-urls 自动过 JS Challenge; IP 被标记时 --captcha-cooldown 60
 ```
 
-## 目录结构
+## 架构
 
+```text
+CLI (main.py)
+  -> 搜索模式 --kw <关键词> --jl <城市>
+       sou.zhaopin.com 302 -> www.zhaopin.com/sou/{jl}{kw编码}/p{n}
+       -> SSR __INITIAL_STATE__.positionList 解析 (含 number) -> CSV
+  -> 详情模式 --detail
+       --detail-numbers <num,>  [推荐] position-detailv2 JSON API (纯协议, 无挑战)
+         GET fe-api/c/i/jobs/position-detailv2?number= -> 详情 JSON -> CSV
+       --detail-urls <url,url>  [兜底] SSR + EdgeOne JS Challenge
+         GET /jobdetail/{id}.htm -> 29KB challenge 壳
+         -> Node vm 求解 EO-Bot-Js-Token -> 带 cookie 重放 -> SSR jobDetail -> CSV
+         [IP 恶化] 交互验证码 -> --captcha-cooldown 冷却重试 或 报错
+  -> 测试: pytest tests/ (固定输入自检, 不依赖网络)
 ```
-1-zhilian-scrawler/
-├── main.py               # CLI 采集器入口
-├── config/settings.py    # 城市代码映射
-├── utils/
-│   ├── http_client.py    # curl_cffi chrome 指纹客户端 (限速/重试)
-│   ├── parser.py         # SSR HTML -> 职位数据解析
-│   └── output.py         # CSV 输出
-├── tests/                # 固定输入自检 + 真实协议测试
-├── tools/                # CloakBrowser 侦察脚本 (capture_*.py)
-├── js_reverse_cache/     # 侦察素材 (HTML/JS/网络样本)
-└── output/               # 采集结果 CSV
+
+关键模块：
+
+```text
+main.py                   CLI 入口 (搜索 + 详情 + 验证码冷却)
+utils/http_client.py      curl_cffi chrome 指纹客户端 (限速 1.2~2.5s/重试)
+utils/fe_api.py           fetch_position_detail_v2: position-detailv2 API (推荐, 无挑战)
+utils/challenge.py        fetch_job_detail: SSR + JS Challenge 求解 (兜底)
+utils/parser.py           SSR 解析 (搜索 positionList + 详情 v2/SSR)
+utils/output.py           CSV 输出 (UTF-8 BOM)
+tools/eo_solve.js         Node vm 挑战执行器 (SSR 兜底路径用)
 ```
 
-## 使用
+## 环境要求
 
-```bash
+- Python 3.11+（curl_cffi、requests）
+- Node.js 24+（仅 SSR 兜底路径需要，`tools/eo_solve.js`；推荐 v2 路径不需要）
+- CloakBrowser（仅侦察，`js-reverse MCP --cloak`；采集不依赖）
+
+```powershell
 pip install -r requirements.txt
-
-# 采集: python 北京(530) 3页
-python main.py --kw python --jl 530 --pages 3
-
-# 多个关键词 + 中文城市
-python main.py --kw python,java,golang --city 北京 --pages 5 --output output/zhaopin.csv
-
-# 测试
-python -m pytest tests/ -v                          # 固定输入自检
-ZHAOPIN_NETWORK_TEST=1 python -m pytest tests/ -v   # 含真实网络测试
 ```
 
-## 逆向状态
+## 采集
 
-- [x] Startup gate: 单 CloakBrowser 基线（Camoufox/js-reverse/chrome-devtools 缺失）
-- [x] Phase 1: 确认真实请求路径（302 重定向 + SSR）
-- [x] Phase 2: 动态字段分类（TLS 指纹门控 / 服务端 kw 编码）
-- [x] Phase 3: 定位突变点（EdgeOne 指纹；编码在服务端）
-- [x] Phase 4: 离线重建（curl_cffi chrome 指纹，无需本地编码）
-- [x] Phase 5: 重复性验证（多关键词/多城市/翻页，positionCount 稳定）
+### 搜索采集
 
-## 风控说明
+```powershell
+py main.py --kw python --jl 530 --pages 3
+py main.py --kw python,java,golang --city 北京 --pages 5 --output output/zhaopin.csv
+```
 
-- 采集含限速（随机 1.2~2.5s/请求）+ 重试 + EdgeOne 拦截检测
-- 高频采集可能触发 EdgeOne 频控，命中后降速重试
-- 仅用于合法合规的数据采集与逆向研究
+### 职位详情采集
 
-> 私有仓库：逆向签名算法代码不公开。如需公开请手动切换 GitHub repo visibility。
+**推荐：position-detailv2 JSON API（纯协议无挑战，无需 Node）**
+
+```powershell
+# number 用搜索页 positionList.number
+py main.py --detail --detail-numbers "CCL1480117890J40614881205,CCL1467242830J40855145310" --output output/zhaopin_detail.csv
+```
+
+**兜底：SSR + EdgeOne JS Challenge（需 Node.js）**
+
+```powershell
+py main.py --detail --detail-urls "https://www.zhaopin.com/jobdetail/CCL1480117890J40614881205.htm,https://www.zhaopin.com/jobdetail/CCL1467242830J40855145310.htm" --output output/zhaopin_detail.csv
+```
+
+触发交互验证码时自动冷却重试：
+
+```powershell
+py main.py --detail --detail-urls "..." --captcha-cooldown 60
+```
+
+### 测试
+
+```powershell
+py -m pytest tests/ -v                          # 固定输入自检 (challenge 求解 + v2/SSR 详情解析)
+ZHAOPIN_NETWORK_TEST=1 py -m pytest tests/ -v   # 含真实网络测试
+```
+
+### 常用选项
+
+```text
+--kw <词>                 搜索关键词 (逗号分隔多个)
+--jl <代码> / --city <名> 城市 (530=北京; 中文名也行)
+--pages <n>               每个关键词页数
+--detail                  详情采集模式
+--detail-numbers <num,>   职位号列表 (推荐, position-detailv2 API 无挑战)
+--detail-urls <url,url>   职位详情 URL 列表 (兜底, SSR + JS Challenge)
+--captcha-cooldown <s>    触发交互验证码后的冷却秒数 (默认 0=直接报错)
+--output <path>           CSV 输出路径
+--sleep <s>               页面间随机等待基础值
+```
+
+## 运行文件
+
+```text
+output/zhaopin.csv          搜索采集结果
+output/zhaopin_detail.csv   详情采集结果
+js_reverse_cache/           逆向素材 (challenge 样本 / TDC 证据 / 报告)
+js_reverse_cache/tasks/     任务证据目录 (zhilian-detail-tdc-001/)
+docs/                       逆向分析文档
+```
+
+## 限速与风控纪律
+
+- 搜索页 + `position-detailv2`（推荐详情路径）纯协议稳定，**不受详情页 IP 信誉影响**（20/20 实测）。
+- SSR 兜底路径：详情页 challenge 自动本地求解，token 可复用 1 小时；**IP 信誉是共享资源**，
+  大量探测会升级到交互验证码（验证码放行绑定浏览器指纹，curl_cffi 无法复用），需冷却 5-30 分钟。
+- curl_cffi 0.16 在 HTTP/2 下 Set-Cookie 解析异常（`r.headers['set-cookie']` 只返回 `path=/`）；
+  SSR 重放只需带 `EO-Bot-Js-Token`（首次重放 1.7MB 已验证），`acw_tc`/`cdn_sec_tc` 非必需。
+- 逐条采集建议 1-2 秒/请求（`--sleep 1.5` 默认），高并发易触发风控。
+
+## 失败策略
+
+| 失败 | 结果 |
+| --- | --- |
+| 超时 / 连接重置 | 指数退避 + 重试（http_client 3 次）|
+| position-detailv2 业务错误（code≠200）| 报错（含 message）|
+| EdgeOne JS Challenge（SSR 详情首跳）| Node vm 本地求解 token → 重放 |
+| 重放后仍 Challenge | 重试（默认 2 次）|
+| 交互验证码 `Security Verification` | `--captcha-cooldown` 冷却重试；否则报错提示冷却 |
+| `__INITIAL_STATE__` 缺失 / JSON 解析失败 | 报错 |
+
+## 逆向研究命令
+
+侦察与验证工具在 `js_reverse_cache/`（均为一次性研究脚本，不入采集主流程）：
+
+```text
+js_reverse_cache/probe_feapi.py        fe-api 纯协议对照 (随机/无参/真实参)
+js_reverse_cache/e2e_detail.py         详情页 challenge 端到端验证
+js_reverse_cache/probe_trigger.py      防线触发条件探测 (高频访问观察升级)
+js_reverse_cache/test_replay_cookie.py requests vs curl_cffi 重放对照
+```
+
+详细逆向过程、防线分级、TDC 协议链与踩坑记录：
+- `docs/zhilian-edgeone-reverse-analysis.md`
+- `js_reverse_cache/tasks/zhilian-detail-tdc-001/report.md`
+
+## 遗留工作
+
+- [x] 详情采集端到端（position-detailv2 纯协议 20/20，推荐路径）
+- [ ] SSR 兜底路径端到端复验（需 IP 信誉恢复；首次已证明可行）
+- [ ] TCaptcha TDC iv8 重建（待 IP 触发时捕获同轮 prehandle/tdc.js/setData 证据）
+- [ ] 更多有价值接口挖掘：
+  - `similar-positions-new`（相似职位）返回空 list，需确认完整参数
+  - `search/positions`（搜索 JSON API）返回 `isVerification:1` 需额外验证，SSR 已绕过
+  - `associational-word`（联想词）、公司工商接口
+
+> 私有仓库：逆向算法代码不公开。如需公开请手动切换 GitHub repo visibility。
