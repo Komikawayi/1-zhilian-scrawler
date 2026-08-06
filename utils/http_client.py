@@ -86,6 +86,28 @@ class ZhilianClient:
             timeout=self.timeout,
         )
 
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Optional[dict] = None,
+        params: Optional[dict] = None,
+        json: Optional[dict] = None,
+        data: Optional[dict] = None,
+        cookies: Optional[dict] = None,
+    ) -> cffi_requests.Response:
+        """统一限速 + POST 请求的公开入口 (登录态接口多为 POST)。"""
+        self._throttle()
+        return self.session.post(
+            url,
+            headers=headers,
+            params=params,
+            json=json,
+            data=data,
+            cookies=cookies,
+            timeout=self.timeout,
+        )
+
     def fetch_search_page(self, keyword: str, city: str, page: int = 1) -> str:
         """
         抓取搜索页 SSR HTML。

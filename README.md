@@ -66,13 +66,33 @@ CLI (main.py)
 
 ```text
 main.py                   CLI 入口 (搜索 + 详情 + 验证码冷却)
+tools/login_collect.py    登录态采集 (简历/消息/投递/VIP/简历诊断)
 utils/http_client.py      curl_cffi chrome 指纹客户端 (限速 1.2~2.5s/重试)
-utils/fe_api.py           fetch_position_detail_v2: position-detailv2 API (推荐, 无挑战)
+utils/fe_api.py           匿名接口 (position-detailv2) + 登录态接口 + 会话过期检测
+utils/session.py          at/rt 登录会话加载/保存 (config/zhilian-session.local.json)
+utils/device.py           deviceSn 纯协议生成/续期 (reportShuMeiDevice, 无需数美 SDK)
 utils/challenge.py        fetch_job_detail: SSR + JS Challenge 求解 (兜底)
 utils/parser.py           SSR 解析 (搜索 positionList + 详情 v2/SSR)
 utils/output.py           CSV 输出 (UTF-8 BOM)
 tools/eo_solve.js         Node vm 挑战执行器 (SSR 兜底路径用)
 ```
+
+> 📄 风控机制分析（登录态/行为信号/心跳/请求节奏/数美）见 **[docs/zhilian-risk-control-analysis.md](docs/zhilian-risk-control-analysis.md)**。
+
+## 登录态采集（需智联账号）
+
+登录态经 URL 参数 `at`（access token）+ `rt`（refresh token）传递。捕获一次登录会话后纯协议采集：
+
+```powershell
+# 1. CloakBrowser 登录智联账号, 提取 cookie 里的 at/rt
+# 2. 保存到 config/zhilian-session.local.json (gitignored):
+#    {"at": "<32hex>", "rt": "<32hex>", "source": "..."}
+# 3. 采集登录态数据
+py tools/login_collect.py --output output/login_state.json
+```
+
+采集内容：简历列表、未读消息、投递/面试统计、VIP、简历诊断。会话过期（code=210）自动提示重捕获。
+
 
 ## 环境要求
 

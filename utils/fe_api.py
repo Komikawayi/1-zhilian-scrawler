@@ -4,17 +4,21 @@
 
 动态参数 (_v / x-zp-page-request-id / x-zp-client-id) 服务端不校验, 随机生成即可。
 
-推荐路径: position-detailv2 职位详情 JSON API, 实测 20/20 稳定,
-无挑战事件、无验证码、无 IP 信誉依赖 (见 docs/zhilian-edgeone-reverse-analysis.md §6.5)。
+两类接口:
+- 匿名接口: position-detailv2 职位详情等, 实测 20/20 稳定, 无挑战/验证码/IP 信誉依赖
+- 登录态接口: 需 URL 参数 at/rt (Session), 简历/消息/投递/VIP 等
+
+登录态经 URL 参数 at(access token)+rt(refresh token) 传递 (见 utils/session.py)。
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
-from typing import Dict
+from typing import Dict, Optional
 
-from curl_cffi import requests as cffi_requests
+from utils.session import Session
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +31,15 @@ FE_API_HEADERS = {
     "referer": "https://www.zhaopin.com/",
 }
 
-DETAIL_V2_URL = "https://fe-api.zhaopin.com/c/i/jobs/position-detailv2"
+BASE_URL = "https://fe-api.zhaopin.com"
 
 
-def _fe_api_params(**extra) -> dict:
-    """构造 fe-api 动态参数 (非签名, 随机即可)。"""
+class LoginExpiredError(ConnectionError):
+    """登录会话过期 (fe-api code=210 未登录), 需重新捕获 at/rt。"""
+
+
+def _fe_api_params(session: Optional[Session] = None, **extra) -> dict:
+    """构造 fe-api 动态参数 (非签名, 随机即可); session 非空时注入 at/rt。"""
     params = {
         "_v": "%.8f" % (time.time() % 1),
         "x-zp-page-request-id": uuid.uuid4().hex + "-" + str(int(time.time() * 1000)),
@@ -39,6 +47,8 @@ def _fe_api_params(**extra) -> dict:
         "platform": "13",
         "version": "0.0.0",
     }
+    if session and session.is_loaded():
+        params.update(session.auth_params())
     params.update(extra)
     return params
 
@@ -49,6 +59,38 @@ def _check_ok(body: Dict, name: str) -> None:
         raise ConnectionError(
             f"{name} 业务错误 code={body.get('code')} apiCode={body.get('apiCode')} msg={body.get('message')}"
         )
+
+
+def _fetch_json(
+    client,
+    path: str,
+    session: Optional[Session] = None,
+    method: str = "GET",
+    params: Optional[dict] = None,
+    body: Optional[dict] = None,
+    name: str = "",
+) -> Dict:
+    """通用 fe-api 请求, 返回响应 JSON。"""
+    url = BASE_URL + path
+    extra = params or {}
+    if method.upper() == "POST":
+        resp = client.post(url, headers=FE_API_HEADERS, params=_fe_api_params(session, **extra), json=body)
+    else:
+        resp = client.get(url, headers=FE_API_HEADERS, params=_fe_api_params(session, **extra))
+    if resp.status_code != 200:
+        raise ConnectionError(f"{name or path} HTTP {resp.status_code}")
+    try:
+        body = resp.json()
+    except json.JSONDecodeError as e:
+        raise ConnectionError(f"{name or path} 响应非 JSON: {e}") from e
+    if body.get("code") == 210:
+        raise LoginExpiredError(f"{name or path} 会话过期 (code=210 未登录), 需重新捕获 at/rt")
+    return body
+
+
+# ---- 匿名接口 ----
+
+DETAIL_V2_URL = BASE_URL + "/c/i/jobs/position-detailv2"
 
 
 def fetch_position_detail_v2(client, number: str) -> Dict:
@@ -67,7 +109,54 @@ def fetch_position_detail_v2(client, number: str) -> Dict:
         raise ConnectionError(f"position-detailv2 HTTP {resp.status_code}")
     try:
         body = resp.json()
-    except Exception as e:
+    except json.JSONDecodeError as e:
         raise ConnectionError(f"position-detailv2 响应非 JSON: {e}") from e
     _check_ok(body, "position-detailv2")
     return body.get("data") or {}
+
+
+# ---- 登录态接口 (需 Session at/rt) ----
+
+def fetch_unread_message(client, session: Session) -> Dict:
+    """未读消息数。匿名 code=210, 登录态 code=200。"""
+    body = _fetch_json(client, "/c/i/user/unread-message", session, name="unread-message")
+    _check_ok(body, "unread-message")
+    return body.get("data")
+
+
+def fetch_resume_list(client, session: Session) -> Dict:
+    """简历列表 (含简历 id/number/完整度)。"""
+    body = _fetch_json(client, "/c/i/resumelist-selectable", session, name="resumelist")
+    _check_ok(body, "resumelist-selectable")
+    return body.get("data")
+
+
+def fetch_resume_feedback_count(client, session: Session) -> Dict:
+    """简历反馈统计 (投递数/面试邀请数/面试数)。"""
+    body = _fetch_json(client, "/c/i/resume/feedback/get-count", session, name="resume-feedback")
+    _check_ok(body, "resume-feedback")
+    return body.get("data")
+
+
+def fetch_vip_info(client, session: Session) -> Dict:
+    """VIP 信息。"""
+    body = _fetch_json(client, "/c/i/business/vip-info", session, name="vip-info")
+    return body.get("data")
+
+
+def fetch_navigation_list(client, session: Session) -> Dict:
+    """导航列表。"""
+    body = _fetch_json(client, "/c/i/navigation-list", session, name="navigation-list")
+    _check_ok(body, "navigation-list")
+    return body.get("data")
+
+
+def fetch_resume_diagnosis(client, session: Session, resume_number: str, resume_id: str) -> Dict:
+    """简历诊断。"""
+    body = _fetch_json(
+        client, "/c/i/resume/diagnosis/number", session,
+        params={"resumeNumber": resume_number, "resumeId": resume_id, "resumeLanguage": 1},
+        name="resume-diagnosis",
+    )
+    _check_ok(body, "resume-diagnosis")
+    return body.get("data")
