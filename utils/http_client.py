@@ -14,13 +14,15 @@ from typing import Optional
 
 from curl_cffi import requests as cffi_requests
 
+from config import settings
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_IMPERSONATE = "chrome"
 
-# 采集时每请求之间的最小/最大间隔（秒），风控友好
-MIN_INTERVAL = 1.2
-MAX_INTERVAL = 2.5
+# 采集时每请求之间的最小/最大间隔（秒），风控友好 — 统一在 config/settings.py 配置
+MIN_INTERVAL = settings.MIN_INTERVAL
+MAX_INTERVAL = settings.MAX_INTERVAL
 
 # 职位详情基础 UA（指纹模拟时 curl_cffi 会自动带 chrome 头，此处仅作兜底）
 BASE_HEADERS = {
@@ -37,8 +39,8 @@ class ZhilianClient:
         impersonate: str = DEFAULT_IMPERSONATE,
         min_interval: float = MIN_INTERVAL,
         max_interval: float = MAX_INTERVAL,
-        retries: int = 3,
-        timeout: int = 25,
+        retries: int = settings.RETRIES,
+        timeout: int = settings.TIMEOUT,
     ) -> None:
         self.impersonate = impersonate
         self.min_interval = min_interval

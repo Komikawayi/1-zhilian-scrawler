@@ -17,3 +17,12 @@ CITY_CODES = {
 }
 
 DEFAULT_CITY = "530"
+
+# ---- 采集运行配置 ----
+# 风控纪律: 智联按 IP 信誉分级, 并发/速率是共享风险资源。
+# 主路径 (搜索 SSR + position-detailv2) 低频串行即可稳定; 高并发易升级防线。
+CONCURRENCY = 1          # 并发数 (1=串行; 不建议>3)
+MIN_INTERVAL = 1.2       # 单请求最小间隔 (秒)
+MAX_INTERVAL = 2.5       # 单请求最大间隔 (秒)
+RETRIES = 3              # 请求重试次数 (指数退避)
+TIMEOUT = 25             # 请求超时 (秒)

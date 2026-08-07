@@ -277,9 +277,7 @@ GET https://captcha.eo.qq.com/cap_union_prehandle
 **verify 表单**：`collect/tlg/eks/sess/ans[/deviceID][/pow][/vData]`，`ans=JSON.stringify(dataManager.getData())`
 = `[{"elem_id":0,"type":"DynAnswerType_TIME","data":""}]`。errorCode 语义：0=成功、9=verifyFailRefresh、12=verifyError。
 
-**当前卡点**：`cap_union_new_verify` 返回 errorCode 9/12（未到 0）。无 ans→9、带 ans→12。ft/deviceID 非决定因素，
-**根因大概率是 Node 沙箱的 collect 环境指纹与真实 Chrome 不一致**。下一步：捕获一轮浏览器真实 verify（人工过验证）
-作为纯协议对照，重放验证 + 定位指纹差异。详见 `js_reverse_cache/tasks/zhilian-detail-tdc-002/report.md`。
+**当前卡点（已定位并封存，2026-08-07）**：`cap_union_new_verify` 的 errorCode 0 需**真实浏览器 collect**。用 CloakBrowser（CDP）捕获浏览器真实 verify：`errorCode:0` + ticket（见 `tasks/zhilian-detail-tdc-002/report.md` Phase A5），同时修正协议封装（`Origin/Referer = captcha.eo.gtimg.com`、带 `deviceID`、`pow_answer`/`pow_calc_time`；POW=`md5(prefix含#+nonce)`，pow_cfg 逐轮随机）。但 Node 沙箱产出的 collect（2880 b64/2160B）vs 浏览器（8940 b64/6704B），差在 tdc.js 内部环境指纹探测，喂序对齐后仍 errorCode 12。**即使纯协议 verify 全通，ticket 也绑定浏览器指纹，curl_cffi 无法解锁业务页**（见 §4）→ TDC 纯协议不作为采集器交付路径，封存。
 
 ---
 
@@ -394,7 +392,7 @@ python main.py --detail --detail-urls "..." --captcha-cooldown 60
 
 - [x] **详情采集端到端**：position-detailv2 纯协议 20/20 验证通过（推荐路径）
 - [ ] **SSR + 挑战路径端到端复验**（需 IP 信誉恢复；首次 e2e 已证明可行）
-- [ ] **TCaptcha TDC 完整落地**：捕获同轮 prehandle/tdc.js/setData 证据，iv8 重建 → collect/eks/POW → new_verify → ticket
+- [x] **TCaptcha TDC 边界确认并封存**：真实请求体已捕获（errorCode 0），协议封装已修正；确认 collect 需真实浏览器 + ticket 绑定指纹，纯协议不可解锁（详见 report.md Phase A5）
 - [ ] 挖掘更多有价值接口（`similar-positions-new` 相似职位、公司详情、简历相关）
 - [ ] 采集器规模化前的风控策略（频率控制、token 复用窗口 3600s、验证码冷却自动退避）
 

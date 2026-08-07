@@ -16,7 +16,7 @@
 | ① 搜索访问门控 | EdgeOne TLS/HTTP2 指纹 (JA3/JA4) | ✅ 已破（`curl_cffi impersonate=chrome`）|
 | ② 详情页主防线 | `EO-Bot-Js-Token`（91-opcode VM，29KB 挑战壳）| ✅ 已破（Node vm 求解，无需解混淆）|
 | ②' 详情数据 | **`position-detailv2` JSON API（纯协议无挑战）** | ✅ **首选路径**（20/20 实测）|
-| ③ 详情页兜底 | TCaptcha TDC（`cap_union_prehandle`/`tdc.js`/`new_verify`）| 🔬 **纯协议链路已打通**（prehandle/tdc.js/collect/eks/ft 已还原），verify 待过 errorCode 12 |
+| ③ 详情页兜底 | TCaptcha TDC（`cap_union_prehandle`/`tdc.js`/`new_verify`）| 🔬 **链路+边界已摸清并封存**：协议链路/POW/真实请求体已还原（见 `tasks/zhilian-detail-tdc-002/`），但 verify 需真实浏览器 collect，且 ticket 绑定浏览器指纹，纯协议无法解锁 |
 | ④ fe-api 动态参数 | `_v` / `x-zp-page-request-id` / `x-zp-client-id` | ✅ 非签名（随机/无参/真实参都 200）|
 
 ### 关键结论（实测）
@@ -70,7 +70,7 @@ tools/login_collect.py    登录态采集 (简历/消息/投递/VIP/简历诊断
 utils/http_client.py      curl_cffi chrome 指纹客户端 (限速 1.2~2.5s/重试)
 utils/fe_api.py           匿名接口 (position-detailv2) + 登录态接口 + 会话过期检测
 utils/session.py          at/rt 登录会话加载/保存 (config/zhilian-session.local.json)
-utils/device.py           deviceSn 纯协议生成/续期 (reportShuMeiDevice, 无需数美 SDK)
+utils/device.py           deviceSn 纯协议生成/续期 (reportShuMeiDevice, 无需数美 SDK) — 预留未接入, 各采集接口不必需
 utils/challenge.py        fetch_job_detail: SSR + JS Challenge 求解 (兜底)
 utils/parser.py           SSR 解析 (搜索 positionList + 详情 v2/SSR)
 utils/output.py           CSV 输出 (UTF-8 BOM)
@@ -203,8 +203,8 @@ js_reverse_cache/test_replay_cookie.py requests vs curl_cffi 重放对照
 ## 遗留工作
 
 - [x] 详情采集端到端（position-detailv2 纯协议 20/20，推荐路径）
-- [x] TCaptcha TDC 协议链还原（prehandle/tdc.js/collect/eks/ft；`js_reverse_cache/tasks/zhilian-detail-tdc-002/`）
-- [ ] TDC verify 端到端成功（errorCode=0；当前 9/12，待浏览器参照定位指纹差异）
+- [x] TCaptcha TDC 协议链还原（prehandle/tdc.js/collect/eks/ft/POW；`js_reverse_cache/tasks/zhilian-detail-tdc-002/`）
+- [x] **TDC 边界确认并封存**：纯协议 verify 需真实浏览器 collect（Node 沙箱环境指纹产不出 6704B 级遥测）；即使拿到 ticket 也绑定浏览器指纹，curl_cffi 无法解锁业务页 → 不作为采集器交付路径
 - [ ] SSR 兜底路径端到端复验（需 IP 信誉恢复；首次已证明可行）
 - [ ] 更多有价值接口挖掘：
   - `similar-positions-new`（相似职位）返回空 list，需确认完整参数
