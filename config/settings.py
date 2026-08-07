@@ -26,3 +26,12 @@ MIN_INTERVAL = 1.2       # 单请求最小间隔 (秒)
 MAX_INTERVAL = 2.5       # 单请求最大间隔 (秒)
 RETRIES = 3              # 请求重试次数 (指数退避)
 TIMEOUT = 25             # 请求超时 (秒)
+
+# ---- 异步流水线 (Phase A: 高并发 + SQLite 入库, 见 collect.py) ----
+# 详情 position-detailv2 无 IP 信誉依赖 (448/448 压测零升级), 可高并发;
+# 搜索 SSR 风控敏感, 保持低频。
+DETAIL_CONCURRENCY = 10          # 详情并发 worker 数
+SEARCH_CONCURRENCY = 2           # 搜索并发 worker 数 (风控敏感)
+DETAIL_RATE_PER_SEC = 8.0        # 全局限速 (请求/秒, 令牌桶跨 worker 共享)
+QUEUE_SIZE = 200                 # 队列容量 (背压)
+DB_PATH = "output/zhaopin.db"    # SQLite 入库路径 (WAL 模式)

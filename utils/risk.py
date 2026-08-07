@@ -12,9 +12,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from typing import Dict, Optional
 
@@ -60,6 +62,7 @@ class RiskState:
 
     def __init__(self, path: Optional[str] = None) -> None:
         self.path = path or DEFAULT_STATE_PATH
+        self._lock = threading.Lock()
         self.state: str = STATE_OK
         self.challenge_streak: int = 0      # 连续 challenge 计数
         self.captcha_count: int = 0         # 累计验证码次数 (用于指数冷却)
@@ -104,23 +107,30 @@ class RiskState:
 
     def on_success(self) -> None:
         """直通/拿到数据: 信誉良好, 重置升级计数。"""
-        self.state = STATE_OK
-        self.challenge_streak = 0
+        with self._lock:
+            self.state = STATE_OK
+            self.challenge_streak = 0
         # 成功不清冷却计数, 冷却期间的成功不解除冷却 (以冷却时间为准)
 
     def on_challenge(self) -> None:
         """遇到 JS Challenge: 信誉在降, 连续计数达到阈值升级。"""
-        self.challenge_streak += 1
-        if self.challenge_streak >= CHALLENGE_ESCALATION:
-            self._enter_cooling(reason="连续 %d 次 challenge" % self.challenge_streak)
-        else:
-            self.state = STATE_CHALLENGE
+        with self._lock:
+            self.challenge_streak += 1
+            if self.challenge_streak >= CHALLENGE_ESCALATION:
+                self._enter_cooling_unlocked(reason="连续 %d 次 challenge" % self.challenge_streak)
+            else:
+                self.state = STATE_CHALLENGE
 
     def on_captcha(self) -> None:
         """交互验证码: 信誉差, 直接进入指数冷却。"""
-        self._enter_cooling(reason="交互验证码")
+        with self._lock:
+            self._enter_cooling_unlocked(reason="交互验证码")
 
     def _enter_cooling(self, reason: str) -> None:
+        with self._lock:
+            self._enter_cooling_unlocked(reason)
+
+    def _enter_cooling_unlocked(self, reason: str) -> None:
         self.state = STATE_COOLING
         self.captcha_count += 1
         self.cooldown_sec = min(COOLDOWN_BASE * (2 ** (self.captcha_count - 1)), COOLDOWN_CAP)
@@ -172,3 +182,23 @@ class RiskState:
         """缓存 token (默认 1h, 匹配 EdgeOne max-age=3600)。"""
         self.tokens[url] = {"token": token, "expires_at": time.time() + ttl}
         logger.debug("缓存 token: url=%s len=%d ttl=%ds", url[:60], len(token), int(ttl))
+
+    # ---- async 支持 (Phase A 高并发流水线) ----
+
+    async def async_await_cooldown(self) -> None:
+        """阻塞直到冷却结束 (async 版, 分片睡眠不阻塞事件循环, 可响应取消)。"""
+        while True:
+            sec = self.remaining_cooldown()
+            if sec <= 0:
+                return
+            logger.info("风控冷却中, 等待 %d 秒", int(sec))
+            await asyncio.sleep(min(sec, 5.0))
+
+    async def async_on_success(self) -> None:
+        self.on_success()
+
+    async def async_on_challenge(self) -> None:
+        self.on_challenge()
+
+    async def async_on_captcha(self) -> None:
+        self.on_captcha()

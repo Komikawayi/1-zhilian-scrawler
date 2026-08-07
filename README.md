@@ -72,6 +72,9 @@ main.py                   CLI 入口 (搜索 + 详情 + 验证码冷却)
 tools/login_collect.py    登录态采集 (简历/消息/投递/VIP/简历诊断)
 utils/http_client.py      curl_cffi chrome 指纹客户端 (限速 1.2~2.5s/重试, 接风控状态机)
 utils/risk.py             风控状态机 (防线分级/自适应速率/指数冷却/token 缓存, 跨 run 持久化)
+utils/storage.py          SQLite 存储层 (positions/companies/runs, 去重增量, WAL)
+utils/async_client.py     异步客户端 (curl_cffi AsyncSession) + 全局令牌桶限速
+utils/pipeline.py         asyncio 流水线 (搜索→队列→详情并发→SQLite)
 utils/fe_api.py           匿名接口 (position-detailv2) + 登录态接口 + 会话过期检测
 utils/session.py          at/rt 登录会话加载/保存 (config/zhilian-session.local.json)
 utils/device.py           deviceSn 纯协议生成/续期 (reportShuMeiDevice, 无需数美 SDK) — 预留未接入, 各采集接口不必需
@@ -142,6 +145,22 @@ py main.py --detail --detail-urls "https://www.zhaopin.com/jobdetail/CCL14801178
 `js_reverse_cache/stress_test.py` 单 IP 匿名压测：**448 条 position-detailv2 连续采集，成功率 100%（448/448），0 挑战 0 验证码，风控全程 `ok`**（~14.6 分钟，0.54 条/s，36 字段完整）。**路线一单 IP 稳定爬取成立**（见 `output/stress_detail.csv`）。
 
 > 登录态说明：路线一、路线二**均不依赖登录态**（匿名可用）。搜索 `positionCount` 恒显示 100 但实际可翻页远超 5 页（实测 p1-p8 全唯一，p=50 仍有数据）。
+
+### 异步流水线（Phase A：高并发 + SQLite 入库）
+
+`collect.py` — asyncio 流水线，搜索低频（风控敏感）+ 详情并发（无 IP 信誉依赖）+ SQLite 入库：
+
+```powershell
+py collect.py --kw python,java --jl 530 --pages 5                    # 搜索+详情并发入库
+py collect.py --kw python --concurrency 10 --resume --export out.csv  # 中断恢复 + 导出
+py collect.py --export out.csv --db output/zhaopin.db                 # 仅导出已入库
+```
+
+**架构**：搜索 SSR（≤2 worker）→ 唯一 number → asyncio.Queue(有界背压) → 详情并发（默认 10 worker，全局限速 8/s）→ SQLite(WAL) upsert。
+
+**并发压测（2026-08-07）**：10 worker 匿名采集 445 条，**58s / ~7.7 条/s，99.8% 成功，风控全程 ok** —— 对比顺序基准 448 条 879s / 0.54 条/s，**提速 ~15x**。DB 落库 444 条详情 + 243 家公司。
+
+表：`positions`(详情, number PK 去重)、`search_pool`(搜索池)、`companies`(公司去重)、`runs`(运行统计)。
 
 ### 测试
 
