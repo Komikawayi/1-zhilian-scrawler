@@ -53,6 +53,27 @@ class AsyncRateLimiter:
             await asyncio.sleep(wait)
 
 
+class RedisRateLimiter:
+    """跨进程全局限速 (Redis 固定窗口, 每秒计数)。多进程 worker 共享同一限速。"""
+
+    def __init__(self, redis, rate_per_sec: float):
+        self.redis = redis
+        self.rate = max(rate_per_sec, 0.0)
+
+    async def acquire(self) -> None:
+        if self.rate <= 0:
+            return
+        key_prefix = "zhaopin:ratelimit"
+        while True:
+            sec = int(time.time())
+            key = f"{key_prefix}:{sec}"
+            n = await self.redis.incr(key)
+            await self.redis.expire(key, 3)
+            if n <= self.rate:
+                return
+            await asyncio.sleep(0.05)
+
+
 class AsyncZhilianClient:
     """异步纯协议客户端 (curl_cffi AsyncSession)。"""
 

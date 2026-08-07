@@ -73,7 +73,8 @@ tools/login_collect.py    登录态采集 (简历/消息/投递/VIP/简历诊断
 utils/http_client.py      curl_cffi chrome 指纹客户端 (限速 1.2~2.5s/重试, 接风控状态机)
 utils/risk.py             风控状态机 (防线分级/自适应速率/指数冷却/token 缓存, 跨 run 持久化)
 utils/storage.py          SQLite 存储层 (positions/companies/runs, 去重增量, WAL)
-utils/async_client.py     异步客户端 (curl_cffi AsyncSession) + 全局令牌桶限速
+utils/async_client.py     异步客户端 (curl_cffi AsyncSession) + 令牌桶限速 + Redis 全局限速
+utils/task_queue.py       Redis 分布式任务队列 (produce/consume, 去重/重试/处理中跟踪)
 utils/pipeline.py         asyncio 流水线 (搜索→队列→详情并发→SQLite)
 utils/fe_api.py           匿名接口 (position-detailv2) + 登录态接口 + 会话过期检测
 utils/session.py          at/rt 登录会话加载/保存 (config/zhilian-session.local.json)
@@ -161,6 +162,29 @@ py collect.py --export out.csv --db output/zhaopin.db                 # 仅导�
 **并发压测（2026-08-07）**：10 worker 匿名采集 445 条，**58s / ~7.7 条/s，99.8% 成功，风控全程 ok** —— 对比顺序基准 448 条 879s / 0.54 条/s，**提速 ~15x**。DB 落库 444 条详情 + 243 家公司。
 
 表：`positions`(详情, number PK 去重)、`search_pool`(搜索池)、`companies`(公司去重)、`runs`(运行统计)。
+
+### Redis 分布式任务队列（Phase B：万级扩量）
+
+`collect.py` 增加 Redis 生产/消费模式，任务池万级 + 多进程 worker 并发消费：
+
+```powershell
+py collect.py --produce --kw python,java --cities 530,538,763,765 --pages 5 --clear   # 建任务池
+py collect.py --consume --workers 4 --concurrency 10 --rate 15                        # 4进程×10并发消费
+py collect.py --stats                                                                 # 队列进度
+```
+
+**架构**：producer 搜索 SSR → 唯一 number `SADD去重+RPUSH` → Redis LIST；N 个 worker 进程 `BLPOP` 领取 → 拉详情 → SQLite。Redis 兼任全局限速（固定窗口，跨进程共享）+ 处理中跟踪（防 worker 误退丢任务）。
+
+**Redis 隔离部署**（不碰公司服务）：
+```bash
+docker network create zhilian-net
+docker run -d --name zhilian-redis --network zhilian-net -p 127.0.0.1:6379:6379 \
+  -v zhilian-redis-data:/data redis:7-alpine redis-server --appendonly yes
+docker update --restart unless-stopped zhilian-redis
+```
+独立网络 `zhilian-net`、仅绑 `127.0.0.1`（不暴露局域网）、独立卷、`appendonly` 持久化。公司服务（qincore/Spider_XHS）在其自有 default 网络，互不干扰。
+
+**规模化验证（2026-08-07）**：4 worker × 10 并发消费 **1705 条，100% 成功 0 失败**，~114s（限速 15/s 打满），DB 落库 1705 详情 + 720 公司。架构就绪可跑万级（1万任务 ≈ 15/s ≈ 11min）。
 
 ### 测试
 

@@ -35,3 +35,9 @@ SEARCH_CONCURRENCY = 2           # 搜索并发 worker 数 (风控敏感)
 DETAIL_RATE_PER_SEC = 8.0        # 全局限速 (请求/秒, 令牌桶跨 worker 共享)
 QUEUE_SIZE = 200                 # 队列容量 (背压)
 DB_PATH = "output/zhaopin.db"    # SQLite 入库路径 (WAL 模式)
+
+# ---- Redis 分布式任务队列 (Phase B: 万级, 隔离部署) ----
+REDIS_URL = "redis://127.0.0.1:6379/0"   # 隔离的 zhilian-redis 容器 (zhilian-net, 仅本机)
+WORKERS = 2                               # 默认消费 worker 进程数
+MAX_ATTEMPTS = 3                          # 任务失败重试次数 (Redis 队列)
+TASK_POOL_CAP = 20000                     # 单任务池上限 (万级护栏)

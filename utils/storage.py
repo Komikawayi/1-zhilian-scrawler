@@ -74,6 +74,7 @@ class Storage:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")   # 多进程并发写防锁
         self._init_schema()
 
     def _init_schema(self) -> None:
