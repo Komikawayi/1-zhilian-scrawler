@@ -16,7 +16,7 @@
 | ① 搜索访问门控 | EdgeOne TLS/HTTP2 指纹 (JA3/JA4) | ✅ 已破（`curl_cffi impersonate=chrome`）|
 | ② 详情页主防线 | `EO-Bot-Js-Token`（91-opcode VM，29KB 挑战壳）| ✅ 已破（Node vm 求解，无需解混淆）|
 | ②' 详情数据 | **`position-detailv2` JSON API（纯协议无挑战）** | ✅ **首选路径**（20/20 实测）|
-| ③ 详情页兜底 | TCaptcha TDC（`cap_union_prehandle`/`tdc.js`/POW/`new_verify`）| 🔬 已摸清（源码级；待触发时捕获同轮证据）|
+| ③ 详情页兜底 | TCaptcha TDC（`cap_union_prehandle`/`tdc.js`/`new_verify`）| 🔬 **纯协议链路已打通**（prehandle/tdc.js/collect/eks/ft 已还原），verify 待过 errorCode 12 |
 | ④ fe-api 动态参数 | `_v` / `x-zp-page-request-id` / `x-zp-client-id` | ✅ 非签名（随机/无参/真实参都 200）|
 
 ### 关键结论（实测）
@@ -203,8 +203,9 @@ js_reverse_cache/test_replay_cookie.py requests vs curl_cffi 重放对照
 ## 遗留工作
 
 - [x] 详情采集端到端（position-detailv2 纯协议 20/20，推荐路径）
+- [x] TCaptcha TDC 协议链还原（prehandle/tdc.js/collect/eks/ft；`js_reverse_cache/tasks/zhilian-detail-tdc-002/`）
+- [ ] TDC verify 端到端成功（errorCode=0；当前 9/12，待浏览器参照定位指纹差异）
 - [ ] SSR 兜底路径端到端复验（需 IP 信誉恢复；首次已证明可行）
-- [ ] TCaptcha TDC iv8 重建（待 IP 触发时捕获同轮 prehandle/tdc.js/setData 证据）
 - [ ] 更多有价值接口挖掘：
   - `similar-positions-new`（相似职位）返回空 list，需确认完整参数
   - `search/positions`（搜索 JSON API）返回 `isVerification:1` 需额外验证，SSR 已绕过

@@ -254,9 +254,36 @@ getWorkloadResult = function(t, n) {
 - **当前未触发**：curl_cffi 高频 15 次也只到 JS Challenge 层；TDC 需 IP 信誉极差或特定指纹
 - **已保存组件源码** → 后续触发时按 workflow 捕获同轮证据（prehandle 响应/tdc.js/setData 序列）落地 iv8 重建
 
+### 6.5 TCaptcha TDC 协议还原进展（zhilian-detail-tdc-002，2026-08-07）
+
+独立构造的 EO widget 页（`appid=25200697`）确定性触发验证码，已打通纯协议链路：
+
+**prehandle（独立 HTTP，无 cookie）**
+```
+GET https://captcha.eo.qq.com/cap_union_prehandle
+  ?aid=25200697 & protocol=https & accver=1 & showtype=inline & lang=zh-cn & fb=1
+```
+返回：`sess`（fresh）、`sid=1343190090`、`data.comm_captcha_cfg.tdc_path`、`data.dyn_show_info`。
+- **`show_type="click_verify"`**（复选框，"确认您是真人"）—— 匹配 workflow 已验证的 click_verify 分支
+- **`pow_cfg=null`** —— 本挑战类型**无需 POW**
+
+**动态 tdc.js**：192-195KB，VM 混淆（obfuscator.io 字符串数组 + 字节码 VM），定义
+`window.TDC = {getInfo, setData, clearTc, getData}`、`window.TDC_NAME`、`window[TDC_NAME]`（352 字符 = eks）。
+
+**Node vm 重建（tdc_solve.js）**：补全浏览器环境（UA-CH/screen/performance/DOM）后 tdc.js 完整运行，
+`setData({isNewEntry}) → setData({slideValue...}) → setData({ft})` → `getData(true)`=collect（2800-3100 字符）、
+`getInfo().info`=eks。**ft 生产者已提取**（widget 模块 48：50 项特性检测 bit-packed base64url）。
+
+**verify 表单**：`collect/tlg/eks/sess/ans[/deviceID][/pow][/vData]`，`ans=JSON.stringify(dataManager.getData())`
+= `[{"elem_id":0,"type":"DynAnswerType_TIME","data":""}]`。errorCode 语义：0=成功、9=verifyFailRefresh、12=verifyError。
+
+**当前卡点**：`cap_union_new_verify` 返回 errorCode 9/12（未到 0）。无 ans→9、带 ans→12。ft/deviceID 非决定因素，
+**根因大概率是 Node 沙箱的 collect 环境指纹与真实 Chrome 不一致**。下一步：捕获一轮浏览器真实 verify（人工过验证）
+作为纯协议对照，重放验证 + 定位指纹差异。详见 `js_reverse_cache/tasks/zhilian-detail-tdc-002/report.md`。
+
 ---
 
-## 6.5 position-detailv2：绕过 EdgeOne 的职位详情 JSON API（本轮重大发现）
+## 6.6 position-detailv2：绕过 EdgeOne 的职位详情 JSON API（本轮重大发现）
 
 从详情页 JS bundle（`jobdetail._code_.web.*.js`）挖出 fe-api 端点清单，其中 **`/c/i/jobs/position-detailv2`** 是职位详情 JSON API，**纯协议直接可调，完全无需挑战/Node/验证码**。
 
