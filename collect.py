@@ -3,9 +3,9 @@
 智联采集器 — CLI (单机异步流水线 + Redis 分布式任务队列)
 
 三种模式:
-  默认      单机异步流水线 (搜索→内存队列→详情并发→SQLite)
+  默认      单机异步流水线 (搜索→内存队列→详情并发→PostgreSQL)
   --produce Redis 模式: 搜索 SSR → 唯一 number 入队 Redis (万级任务池)
-  --consume Redis 模式: N 个 worker 进程并发领任务拉详情 → SQLite
+  --consume Redis 模式: N 个 worker 进程并发领任务拉详情 → PostgreSQL
   --stats   Redis 模式: 队列统计
 
 用法:

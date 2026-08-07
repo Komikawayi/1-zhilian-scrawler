@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-PostgreSQL 存储层 (asyncpg) — 百万级数据入库 (Phase C)
+PostgreSQL 存储层 (asyncpg) — 百万级数据入库 (生产主存储)
 
-替代 Phase A 的 SQLite (utils/storage.py):
+相较 SQLite(Phase A, 已移除):
   - 原生并发写: 多 worker 进程并发 upsert, 无单写者瓶颈
   - 连接池: asyncpg pool (min_size/max_size)
   - JSONB: raw_json 结构化存储

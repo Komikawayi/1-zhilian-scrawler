@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-单机异步流水线 — 搜索生产者 + 详情消费者 + SQLite 入库
+单机异步流水线 — 搜索生产者 + 详情消费者 + PostgreSQL 入库
 
 Phase A 核心: 详情并发 (默认 10, 无 IP 信誉依赖), 搜索低频 (风控敏感)。
 
 链路:
   搜索 SSR (低频, ≤search_concurrency) → 唯一 number → asyncio.Queue(有界, 背压)
-    → 详情并发拉取 (detail_concurrency) → upsert SQLite (positions/companies)
+    → 详情并发拉取 (detail_concurrency) → upsert PostgreSQL (positions/companies)
 
 特性:
   - 全局限速器 (AsyncRateLimiter, 跨 worker 共享)

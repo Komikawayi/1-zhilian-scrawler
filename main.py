@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-智联招聘采集器 (纯协议版) — 搜索 SSR + 职位详情
+[LEGACY] 智联招聘采集器 — 顺序单并发版 (搜索 SSR + 职位详情, CSV 输出)
+
+注意: 生产采集请用 collect.py (异步流水线 + PostgreSQL + Redis 分布式)。
+本文件保留的唯一独立价值: SSR + EdgeOne JS Challenge 兜底路径 (--detail-urls),
+collect.py 未覆盖。新功能请加在 collect.py。
 
 用法:
     # 搜索采集: python 北京(530) 3页
