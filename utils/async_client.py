@@ -54,24 +54,43 @@ class AsyncRateLimiter:
 
 
 class RedisRateLimiter:
-    """跨进程全局限速 (Redis 固定窗口, 每秒计数)。多进程 worker 共享同一限速。"""
+    """跨进程全局限速 (Redis 滑动窗口, Lua 原子)。避免固定窗口边界 2x 突发。
+
+    窗口 = 1s, 容量 = rate_per_sec。ZSET 记录时间戳, 过期成员自动清理。
+    """
+
+    _LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window_ms = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window_ms)
+local count = redis.call('ZCARD', key)
+if count < limit then
+  local seq = redis.call('INCR', key .. ':seq')
+  redis.call('ZADD', key, now, now .. '-' .. seq)
+  redis.call('EXPIRE', key, math.ceil(window_ms / 1000))
+  redis.call('EXPIRE', key .. ':seq', math.ceil(window_ms / 1000))
+  return 1
+end
+return 0
+"""
 
     def __init__(self, redis, rate_per_sec: float):
         self.redis = redis
         self.rate = max(rate_per_sec, 0.0)
+        self.key = "zhaopin:ratelimit:sw"
 
     async def acquire(self) -> None:
         if self.rate <= 0:
             return
-        key_prefix = "zhaopin:ratelimit"
+        window_ms = 1000
         while True:
-            sec = int(time.time())
-            key = f"{key_prefix}:{sec}"
-            n = await self.redis.incr(key)
-            await self.redis.expire(key, 3)
-            if n <= self.rate:
+            ok = await self.redis.eval(self._LUA, 1, self.key,
+                                       int(time.time() * 1000), window_ms, self.rate)
+            if ok:
                 return
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)
 
 
 class AsyncZhilianClient:

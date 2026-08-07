@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
-from utils.task_queue import TaskQueue
+from utils.task_queue import PREFIX, TaskQueue
 
 TEST_URL = "redis://127.0.0.1:6379/15"
 
@@ -88,6 +89,39 @@ def test_is_drained():
             assert not await q.is_drained()       # 在途
             await q.complete("Z")
             assert await q.is_drained()
+        finally:
+            await q.close()
+    _run(_())
+
+
+def test_recover_stale():
+    """崩溃回收: 超时在途任务重新入队。"""
+    _clear()
+    async def _():
+        q = TaskQueue(TEST_URL)
+        try:
+            await q.enqueue("A")
+            await q.dequeue(timeout=1)                        # A 进 processing
+            old = str(time.time() - 200)
+            await q.redis.hset(f"{PREFIX}processing", "A", old)  # 伪造超时
+            n = await q.recover_stale(max_age=120)
+            assert n == 1
+            s = await q.stats()
+            assert s["processing"] == 0 and s["queue"] == 1   # A 重新入队
+        finally:
+            await q.close()
+    _run(_())
+
+
+def test_recover_lock_single():
+    """recover 分布式锁: 第二个调用不重复执行。"""
+    _clear()
+    async def _():
+        q = TaskQueue(TEST_URL)
+        try:
+            await q.redis.set("zhaopin:lock:recover", "1", ex=30)  # 模拟他人持锁
+            n = await q.recover_stale()
+            assert n == 0
         finally:
             await q.close()
     _run(_())

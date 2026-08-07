@@ -212,8 +212,18 @@ async def _consume_loop(client, queue, storage, cfg: WorkerConfig) -> Dict:
                         cfg.worker_id, done, ok, fail, el, done / el if el else 0)
 
 
+async def _watchdog(queue, interval: float = 30.0, max_age: int = 120) -> None:
+    """崩溃回收 watchdog: 周期性回收超时在途任务 (分布式锁防并发)。"""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            await queue.recover_stale(max_age=max_age)
+    except asyncio.CancelledError:
+        pass
+
+
 async def _worker_loop(cfg: WorkerConfig) -> Dict:
-    """单个 worker 进程的 asyncio 循环 (并发 detail 协程)。"""
+    """单个 worker 进程的 asyncio 循环 (并发 detail 协程 + 崩溃 watchdog)。"""
     queue = TaskQueue(cfg.redis_url)
     rate_limiter = RedisRateLimiter(queue.redis, cfg.rate_per_sec)
     risk = RiskState()
@@ -221,13 +231,14 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
     storage = await AsyncStorage.create(cfg.db_url)
     try:
         coros = [_consume_loop(client, queue, storage, cfg) for _ in range(cfg.concurrency)]
+        coros.append(_watchdog(queue))                      # 崩溃回收
         results = await asyncio.gather(*coros)
     finally:
         await client.close()
         await storage.close()
         await queue.close()
-    ok = sum(r["ok"] for r in results)
-    fail = sum(r["fail"] for r in results)
+    ok = sum(r.get("ok", 0) for r in results if isinstance(r, dict))
+    fail = sum(r.get("fail", 0) for r in results if isinstance(r, dict))
     logger.info("worker%d 完成: 成功%d 失败%d", cfg.worker_id, ok, fail)
     return {"ok": ok, "fail": fail}
 

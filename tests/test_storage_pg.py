@@ -36,9 +36,22 @@ def _ensure_test_db():
     _run(_())
 
 
+def _clear_tables(url):
+    """清空测试库表 (跨运行隔离, 避免残留数据干扰断言)。"""
+    async def _():
+        s = await AsyncStorage.create(url)
+        try:
+            for t in ("positions", "companies", "search_pool", "runs"):
+                await s.pool.execute(f'TRUNCATE TABLE {t}')
+        finally:
+            await s.close()
+    _run(_())
+
+
 def test_upsert_position_dedup():
     _ensure_test_db()
     url = _base_url()
+    _clear_tables(url)
 
     async def _():
         s = await AsyncStorage.create(url)
@@ -62,6 +75,7 @@ def test_upsert_position_dedup():
 def test_runs_and_export(tmp_path):
     _ensure_test_db()
     url = _base_url()
+    _clear_tables(url)
 
     async def _():
         s = await AsyncStorage.create(url)
