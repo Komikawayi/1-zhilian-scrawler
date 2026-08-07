@@ -15,7 +15,7 @@
 |----|------|------|
 | ① 搜索访问门控 | EdgeOne TLS/HTTP2 指纹 (JA3/JA4) | ✅ 已破（`curl_cffi impersonate=chrome`）|
 | ② 详情页主防线 | `EO-Bot-Js-Token`（91-opcode VM，29KB 挑战壳）| ✅ 已破（Node vm 求解，无需解混淆）|
-| ②' 详情数据 | **`position-detailv2` JSON API（纯协议无挑战）** | ✅ **首选路径**（20/20 实测）|
+| ②' 详情数据 | **`position-detailv2` JSON API（纯协议无挑战）** | ✅ **默认路径**（匿名 448/448 压测零升级）|
 | ③ 详情页兜底 | TCaptcha TDC（`cap_union_prehandle`/`tdc.js`/`new_verify`）| 🔬 **链路+边界已摸清并封存**：协议链路/POW/真实请求体已还原（见 `tasks/zhilian-detail-tdc-002/`），但 verify 需真实浏览器 collect，且 ticket 绑定浏览器指纹，纯协议无法解锁 |
 | ④ fe-api 动态参数 | `_v` / `x-zp-page-request-id` / `x-zp-client-id` | ✅ 非签名（随机/无参/真实参都 200）|
 
@@ -24,9 +24,10 @@
 - **搜索** `sou.zhaopin.com`：EdgeOne 按 TLS/HTTP2 指纹放行，`curl_cffi chrome` 直接过，302 后取 SSR
   `__INITIAL_STATE__.positionList`（20 条/页）。kw 编码在服务端完成，客户端无需自实现。
   多关键词/多城市/翻页 positionCount 稳定。
-- **职位详情（推荐）** `position-detailv2` JSON API：`number` 用搜索页 `positionList.number`，
-  纯协议直接拿 `{ detailedPosition(67字段), detailedCompany(22字段), taskId }`，**20/20 稳定、
+- **职位详情（默认路线一）** `position-detailv2` JSON API：`number` 用搜索页 `positionList.number`，
+  纯协议直接拿 `{ detailedPosition(67字段), detailedCompany(22字段), taskId }`，**448/448 压测零升级、
   0 挑战、0 验证码、无 IP 信誉依赖**，`jobDesc` 完整。比 SSR 快（5KB vs 1.7MB）、无 Node 依赖。
+  匿名搜索池实测远超 5 页（positionCount 恒显示 100 但 p1-p8 全唯一）。
 - **职位详情（兜底）** `www.zhaopin.com/jobdetail/<id>.htm` SSR：无 cookie 首跳稳定返回 **29KB JS Challenge 壳**。
   内联 script 含 91-opcode VM + SHA 常量，执行后定义 `window.solveChallenge(challenge, seed)`，
   Node vm 沙箱直接执行得 token（`local#...`，683 字符，max-age 3600s），带 cookie 重放拿到
@@ -41,8 +42,9 @@
 ### 正确使用姿势
 
 ```
-详情采集:   搜索拿 number → position-detailv2 (纯协议, 无需挑战/Node/验证码)
-SSR 兜底:   --detail-urls 自动过 JS Challenge; IP 被标记时 --captcha-cooldown 60
+默认详情采集:   --detail --kw <词> --jl <城市>   (搜索 → position-detailv2, 纯协议, 匿名可用)
+显式详情采集:   --detail --detail-numbers "<num,>"
+SSR 兜底:      --detail-urls 自动过 JS Challenge; IP 被标记时风控状态机自动指数冷却
 ```
 
 ## 架构
@@ -53,12 +55,13 @@ CLI (main.py)
        sou.zhaopin.com 302 -> www.zhaopin.com/sou/{jl}{kw编码}/p{n}
        -> SSR __INITIAL_STATE__.positionList 解析 (含 number) -> CSV
   -> 详情模式 --detail
-       --detail-numbers <num,>  [推荐] position-detailv2 JSON API (纯协议, 无挑战)
+       --detail --kw <词>      [默认路线一] 搜索 -> number -> position-detailv2 JSON API
+       --detail-numbers <num,> [路线一] position-detailv2 (纯协议, 无挑战, 匿名 448/448 实测)
          GET fe-api/c/i/jobs/position-detailv2?number= -> 详情 JSON -> CSV
-       --detail-urls <url,url>  [兜底] SSR + EdgeOne JS Challenge
+       --detail-urls <url,url> [兜底路线二] SSR + EdgeOne JS Challenge
          GET /jobdetail/{id}.htm -> 29KB challenge 壳
          -> Node vm 求解 EO-Bot-Js-Token -> 带 cookie 重放 -> SSR jobDetail -> CSV
-         [IP 恶化] 交互验证码 -> --captcha-cooldown 冷却重试 或 报错
+         [IP 恶化] 交互验证码 -> 风控状态机指数冷却后重试
   -> 测试: pytest tests/ (固定输入自检, 不依赖网络)
 ```
 
@@ -67,7 +70,8 @@ CLI (main.py)
 ```text
 main.py                   CLI 入口 (搜索 + 详情 + 验证码冷却)
 tools/login_collect.py    登录态采集 (简历/消息/投递/VIP/简历诊断)
-utils/http_client.py      curl_cffi chrome 指纹客户端 (限速 1.2~2.5s/重试)
+utils/http_client.py      curl_cffi chrome 指纹客户端 (限速 1.2~2.5s/重试, 接风控状态机)
+utils/risk.py             风控状态机 (防线分级/自适应速率/指数冷却/token 缓存, 跨 run 持久化)
 utils/fe_api.py           匿名接口 (position-detailv2) + 登录态接口 + 会话过期检测
 utils/session.py          at/rt 登录会话加载/保存 (config/zhilian-session.local.json)
 utils/device.py           deviceSn 纯协议生成/续期 (reportShuMeiDevice, 无需数美 SDK) — 预留未接入, 各采集接口不必需
@@ -115,24 +119,29 @@ py main.py --kw python,java,golang --city 北京 --pages 5 --output output/zhaop
 
 ### 职位详情采集
 
-**推荐：position-detailv2 JSON API（纯协议无挑战，无需 Node）**
+**默认路线一：搜索 → position-detailv2 JSON API（纯协议、匿名、无挑战/Node）**
 
 ```powershell
-# number 用搜索页 positionList.number
+# 一条命令: 搜索收集 number -> 自动走 position-detailv2 详情
+py main.py --detail --kw python,java,golang --jl 530 --pages 5 --output output/zhaopin_detail.csv
+
+# 或显式给 number (来自搜索页 positionList.number)
 py main.py --detail --detail-numbers "CCL1480117890J40614881205,CCL1467242830J40855145310" --output output/zhaopin_detail.csv
 ```
 
-**兜底：SSR + EdgeOne JS Challenge（需 Node.js）**
+**兜底路线二：SSR + EdgeOne JS Challenge（需 Node.js，IP 信誉敏感）**
 
 ```powershell
-py main.py --detail --detail-urls "https://www.zhaopin.com/jobdetail/CCL1480117890J40614881205.htm,https://www.zhaopin.com/jobdetail/CCL1467242830J40855145310.htm" --output output/zhaopin_detail.csv
+py main.py --detail --detail-urls "https://www.zhaopin.com/jobdetail/CCL1480117890J40614881205.htm" --output output/zhaopin_detail.csv
 ```
 
-触发交互验证码时自动冷却重试：
+触发交互验证码时风控状态机自动指数冷却重试（`config/zhilian-risk.local.json` 跨 run 记忆），无需手动 `--captcha-cooldown`。
 
-```powershell
-py main.py --detail --detail-urls "..." --captcha-cooldown 60
-```
+### 规模化压测结论（2026-08-07）
+
+`js_reverse_cache/stress_test.py` 单 IP 匿名压测：**448 条 position-detailv2 连续采集，成功率 100%（448/448），0 挑战 0 验证码，风控全程 `ok`**（~14.6 分钟，0.54 条/s，36 字段完整）。**路线一单 IP 稳定爬取成立**（见 `output/stress_detail.csv`）。
+
+> 登录态说明：路线一、路线二**均不依赖登录态**（匿名可用）。搜索 `positionCount` 恒显示 100 但实际可翻页远超 5 页（实测 p1-p8 全唯一，p=50 仍有数据）。
 
 ### 测试
 
@@ -174,15 +183,26 @@ docs/                       逆向分析文档
   SSR 重放只需带 `EO-Bot-Js-Token`（首次重放 1.7MB 已验证），`acw_tc`/`cdn_sec_tc` 非必需。
 - 逐条采集建议 1-2 秒/请求（`--sleep 1.5` 默认），高并发易触发风控。
 
+## 风控状态机（utils/risk.py）
+
+采集全程接入跨 run 持久化的 IP 信誉状态机（`config/zhilian-risk.local.json`，gitignored）：
+
+- **防线分级**：`ok(直通) → challenge(JS挑战,可解) → captcha(交互验证码,需冷却) → cooling`
+- **自适应速率**：challenge 期间请求间隔 ×2，冷却期 ×4（配合 `http_client` 限速）
+- **指数冷却**：验证码触发后 60s/120s/240s… 递增（上限 30min），跨 run 记忆，下次启动自动等完冷却
+- **EO-Bot-Js-Token 缓存**：挑战 token 1h 复用，不再每请求重复执行 Node
+- **搜索路径风控重试**：单页触发验证码自动冷却后重试（3 轮），不再硬中断整批
+
 ## 失败策略
 
 | 失败 | 结果 |
 | --- | --- |
 | 超时 / 连接重置 | 指数退避 + 重试（http_client 3 次）|
 | position-detailv2 业务错误（code≠200）| 报错（含 message）|
-| EdgeOne JS Challenge（SSR 详情首跳）| Node vm 本地求解 token → 重放 |
-| 重放后仍 Challenge | 重试（默认 2 次）|
-| 交互验证码 `Security Verification` | `--captcha-cooldown` 冷却重试；否则报错提示冷却 |
+| EdgeOne JS Challenge（SSR 详情首跳）| 优先复用缓存 token → 否则 Node vm 求解 → 重放 |
+| 重放后仍 Challenge | 重试（默认 2 次）+ 状态机连续计数升级 |
+| 交互验证码 `Security Verification` | 进入指数冷却（跨 run 记忆），冷却后自动重试 |
+| 搜索页中途验证码 | 自动冷却重试（3 轮）|
 | `__INITIAL_STATE__` 缺失 / JSON 解析失败 | 报错 |
 
 ## 逆向研究命令
@@ -193,6 +213,7 @@ docs/                       逆向分析文档
 js_reverse_cache/probe_feapi.py        fe-api 纯协议对照 (随机/无参/真实参)
 js_reverse_cache/e2e_detail.py         详情页 challenge 端到端验证
 js_reverse_cache/probe_trigger.py      防线触发条件探测 (高频访问观察升级)
+js_reverse_cache/stress_test.py        单 IP 规模化压测 (搜索池 + position-detailv2 448 条)
 js_reverse_cache/test_replay_cookie.py requests vs curl_cffi 重放对照
 ```
 

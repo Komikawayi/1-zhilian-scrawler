@@ -15,6 +15,7 @@ from typing import Optional
 from curl_cffi import requests as cffi_requests
 
 from config import settings
+from utils.risk import RiskState, STATE_CHALLENGE, STATE_COOLING
 
 logger = logging.getLogger(__name__)
 
@@ -41,23 +42,46 @@ class ZhilianClient:
         max_interval: float = MAX_INTERVAL,
         retries: int = settings.RETRIES,
         timeout: int = settings.TIMEOUT,
+        risk: Optional[RiskState] = None,
     ) -> None:
         self.impersonate = impersonate
         self.min_interval = min_interval
         self.max_interval = max_interval
         self.retries = retries
         self.timeout = timeout
+        # 风控状态机 (可选): 冷却阻塞 + 自适应速率因子
+        self.risk = risk
         self.session = cffi_requests.Session(impersonate=impersonate)
         self.session.headers.update(BASE_HEADERS)
         self._last_request_at = 0.0
 
     def _throttle(self) -> None:
-        """限速：每请求间随机等待。"""
+        """限速：每请求间随机等待 (接入风控状态机时叠加速率因子/冷却)。"""
+        if self.risk is not None:
+            # 冷却期阻塞等待 (避免在验证码冷却窗口内硬闯)
+            self.risk.await_cooldown()
         elapsed = time.monotonic() - self._last_request_at
-        wait = random.uniform(self.min_interval, self.max_interval)
+        base = random.uniform(self.min_interval, self.max_interval)
+        factor = self.risk.rate_factor() if self.risk is not None else 1.0
+        wait = base * factor
         if elapsed < wait:
             time.sleep(wait - elapsed)
         self._last_request_at = time.monotonic()
+
+    def report_success(self) -> None:
+        """请求拿到真实数据: 通知风控状态机 (重置升级计数)。"""
+        if self.risk is not None:
+            self.risk.on_success()
+
+    def report_challenge(self) -> None:
+        """遇到 JS Challenge 壳: 通知风控状态机 (连续计数/可能升级)。"""
+        if self.risk is not None:
+            self.risk.on_challenge()
+
+    def report_captcha(self) -> None:
+        """遇到交互验证码: 通知风控状态机 (进入指数冷却)。"""
+        if self.risk is not None:
+            self.risk.on_captcha()
 
     def get(
         self,
@@ -130,9 +154,13 @@ class ZhilianClient:
                     raise ConnectionError(f"HTTP {resp.status_code}")
                 text = resp.text
                 if "Security Verification" in text:
+                    self.report_captcha()
                     raise ConnectionError("EdgeOne 拦截 (Security Verification)")
                 if "__INITIAL_STATE__" not in text:
+                    # 可能是 JS Challenge 壳或异常页 (搜索页 curl_cffi chrome 直接过, 防御性上报)
+                    self.report_challenge()
                     raise ConnectionError("响应缺少 __INITIAL_STATE__")
+                self.report_success()
                 logger.debug("kw=%s city=%s page=%d -> %s (len=%d)", keyword, city, page, resp.url, len(text))
                 return text
             except Exception as e:  # noqa: BLE001

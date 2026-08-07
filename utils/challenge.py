@@ -123,6 +123,7 @@ def fetch_job_detail(
     position_url: str,
     retries: int = 2,
     captcha_cooldown: float = 0.0,
+    risk=None,
 ) -> str:
     """
     抓取职位详情页 SSR HTML, 自动处理 EdgeOne JS Challenge (兜底路径)。
@@ -131,7 +132,8 @@ def fetch_job_detail(
         client: ZhilianClient 实例
         position_url: 职位详情 URL (如 http://www.zhaopin.com/jobdetail/{id}.htm)
         retries: challenge 求解重试次数 (实际尝试 retries+1 次)
-        captcha_cooldown: 触发交互验证码后等待的冷却秒数 (0=不等待直接抛错)
+        captcha_cooldown: CLI 兜底的冷却秒数 (有 risk 状态机时以状态机冷却为准)
+        risk: RiskState 实例 (可选) — token 缓存复用 + 防线上报
 
     Returns:
         含 __INITIAL_STATE__ 的真实 SSR HTML
@@ -153,31 +155,51 @@ def fetch_job_detail(
 
         # 拿到真实数据
         if "__INITIAL_STATE__" in html and "jobDetail" in html:
+            client.report_success()
             return html
 
         # 交互验证码 (IP 信誉恶化) -> 冷却后重试或抛错
-        if is_captcha_page(html) and _handle_captcha(captcha_cooldown, is_last):
-            continue
-
-        # JS Challenge -> 本地求解 -> 带 cookie 重放
-        if is_challenge_html(html):
-            script = extract_script(html)
-            if not script:
-                raise ConnectionError("challenge 壳中未找到内联 script")
-            token = solve_challenge_js(script, href=position_url)
-            if not token:
-                last_err = ConnectionError("challenge JS 求解失败")
+        if is_captcha_page(html):
+            client.report_captcha()
+            if risk is not None:
+                risk.await_cooldown()
+                if not is_last:
+                    continue
+            if _handle_captcha(captcha_cooldown, is_last):
                 continue
-            logger.debug("详情页 attempt=%d 已解出 EO-Bot-Js-Token, 重放", attempt)
+
+        # JS Challenge -> 缓存复用或本地求解 -> 带 cookie 重放
+        if is_challenge_html(html):
+            client.report_challenge()
+            token = risk.get_token(position_url) if risk is not None else None
+            if not token:
+                script = extract_script(html)
+                if not script:
+                    raise ConnectionError("challenge 壳中未找到内联 script")
+                token = solve_challenge_js(script, href=position_url)
+                if not token:
+                    last_err = ConnectionError("challenge JS 求解失败")
+                    continue
+                if risk is not None:
+                    risk.set_token(position_url, token)
+                    risk.save()
+            logger.debug("详情页 attempt=%d 使用 EO-Bot-Js-Token (len=%d), 重放", attempt, len(token))
             resp2 = client.get(position_url, cookies={"EO-Bot-Js-Token": token})
             if resp2.status_code != 200:
                 last_err = ConnectionError(f"重放 HTTP {resp2.status_code}")
                 continue
             html2 = resp2.text
             if "__INITIAL_STATE__" in html2 and "jobDetail" in html2:
+                client.report_success()
                 return html2
-            if is_captcha_page(html2) and _handle_captcha(captcha_cooldown, is_last):
-                continue
+            if is_captcha_page(html2):
+                client.report_captcha()
+                if risk is not None:
+                    risk.await_cooldown()
+                    if not is_last:
+                        continue
+                if _handle_captcha(captcha_cooldown, is_last):
+                    continue
             last_err = ConnectionError(
                 f"重放后仍未拿到数据 (len={len(html2)}, challenge={is_challenge_html(html2)})"
             )
