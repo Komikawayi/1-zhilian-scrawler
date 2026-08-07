@@ -72,10 +72,10 @@ main.py                   CLI 入口 (搜索 + 详情 + 验证码冷却)
 tools/login_collect.py    登录态采集 (简历/消息/投递/VIP/简历诊断)
 utils/http_client.py      curl_cffi chrome 指纹客户端 (限速 1.2~2.5s/重试, 接风控状态机)
 utils/risk.py             风控状态机 (防线分级/自适应速率/指数冷却/token 缓存, 跨 run 持久化)
-utils/storage.py          SQLite 存储层 (positions/companies/runs, 去重增量, WAL)
+utils/storage_pg.py        PostgreSQL 存储层 (asyncpg 连接池, 百万级, 主存储)
 utils/async_client.py     异步客户端 (curl_cffi AsyncSession) + 令牌桶限速 + Redis 全局限速
 utils/task_queue.py       Redis 分布式任务队列 (produce/consume, 去重/重试/处理中跟踪)
-utils/pipeline.py         asyncio 流水线 (搜索→队列→详情并发→SQLite)
+utils/pipeline.py         asyncio 流水线 (搜索→队列→详情并发→PostgreSQL)
 utils/fe_api.py           匿名接口 (position-detailv2) + 登录态接口 + 会话过期检测
 utils/session.py          at/rt 登录会话加载/保存 (config/zhilian-session.local.json)
 utils/device.py           deviceSn 纯协议生成/续期 (reportShuMeiDevice, 无需数美 SDK) — 预留未接入, 各采集接口不必需
@@ -173,7 +173,7 @@ py collect.py --consume --workers 4 --concurrency 10 --rate 15                  
 py collect.py --stats                                                                 # 队列进度
 ```
 
-**架构**：producer 搜索 SSR → 唯一 number `SADD去重+RPUSH` → Redis LIST；N 个 worker 进程 `BLPOP` 领取 → 拉详情 → SQLite。Redis 兼任全局限速（固定窗口，跨进程共享）+ 处理中跟踪（防 worker 误退丢任务）。
+**架构**：producer 搜索 SSR → 唯一 number `SADD去重+RPUSH` → Redis LIST；N 个 worker 进程 `BLPOP` 领取 → 拉详情 → **PostgreSQL**。Redis 兼任全局限速（固定窗口，跨进程共享）+ 处理中跟踪（防 worker 误退丢任务）。
 
 **Redis 隔离部署**（不碰公司服务）：
 ```bash
@@ -184,7 +184,16 @@ docker update --restart unless-stopped zhilian-redis
 ```
 独立网络 `zhilian-net`、仅绑 `127.0.0.1`（不暴露局域网）、独立卷、`appendonly` 持久化。公司服务（qincore/Spider_XHS）在其自有 default 网络，互不干扰。
 
-**规模化验证（2026-08-07）**：4 worker × 10 并发消费 **1705 条，100% 成功 0 失败**，~114s（限速 15/s 打满），DB 落库 1705 详情 + 720 公司。架构就绪可跑万级（1万任务 ≈ 15/s ≈ 11min）。
+**PostgreSQL 隔离部署**（百万级存储，不碰公司服务）：
+```bash
+docker run -d --name zhilian-postgres --network zhilian-net -p 127.0.0.1:5433:5432 \
+  -e POSTGRES_USER=zhilian -e POSTGRES_PASSWORD=<pwd> -e POSTGRES_DB=zhilian \
+  -v zhilian-postgres-data:/var/lib/postgresql/data postgres:16-alpine
+docker update --restart unless-stopped zhilian-postgres
+```
+连接串存 `config/db.local.json`（gitignored，`{"db_url": "postgresql://zhilian:...@127.0.0.1:5433/zhilian"}`），或环境变量 `ZHAOPIN_DB_URL`。asyncpg 连接池、JSONB、原生并发写（多 worker 进程）。
+
+**规模化验证（2026-08-07）**：4 worker × 10 并发消费 **1705 条，100% 成功 0 失败**，~114s（限速 15/s 打满），PG 落库 1705 详情 + 720 公司。架构就绪可跑万级（1万任务 ≈ 15/s ≈ 11min），后续可扩百万级（多城市×多关键词，每查询 ~1000 独立池）。
 
 ### 测试
 

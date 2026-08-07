@@ -28,7 +28,7 @@ from utils.async_client import (
 )
 from utils.parser import extract_initial_state, parse_position_detail_v2
 from utils.risk import RiskState
-from utils.storage import Storage
+from utils.storage_pg import AsyncStorage
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +42,17 @@ class PipelineConfig:
     search_concurrency: int = 2
     queue_size: int = 200
     detail_rate_per_sec: float = 8.0
-    db_path: str = "output/zhaopin.db"
+    db_url: str = ""          # PostgreSQL URL (asyncpg); 空则用 settings.DB_URL
     resume: bool = False
     name: str = ""
 
 
 class Pipeline:
-    """asyncio 采集流水线 (搜索 → 队列 → 详情并发 → SQLite)。"""
+    """asyncio 采集流水线 (搜索 → 队列 → 详情并发 → PostgreSQL)。"""
 
     def __init__(self, cfg: PipelineConfig):
         self.cfg = cfg
-        self.storage = Storage(cfg.db_path)
+        self.storage: AsyncStorage = None
         self.risk = RiskState()
         self.rate_limiter = AsyncRateLimiter(cfg.detail_rate_per_sec)
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=cfg.queue_size)
@@ -66,14 +66,16 @@ class Pipeline:
     async def run(self) -> Dict:
         """执行流水线, 返回统计。"""
         self.started = time.time()
+        from config import settings as _settings
+        self.storage = await AsyncStorage.create(self.cfg.db_url or _settings.DB_URL)
         if self.cfg.resume:
-            existing = await asyncio.to_thread(self.storage.get_existing_numbers)
+            existing = await self.storage.get_existing_numbers()
             self._seen = existing
             logger.info("resume: 跳过已入库 %d 个 number", len(existing))
         params = {"keywords": self.cfg.keywords, "city": self.cfg.city, "pages": self.cfg.pages,
                   "concurrency": self.cfg.detail_concurrency, "resume": self.cfg.resume,
                   "name": self.cfg.name}
-        run_id = await asyncio.to_thread(self.storage.start_run, "pipeline", params)
+        run_id = await self.storage.start_run("pipeline", params)
         client = AsyncZhilianClient(risk=self.risk, rate_limiter=self.rate_limiter)
         try:
             producers = [asyncio.create_task(self._search_worker(client, kw))
@@ -88,8 +90,8 @@ class Pipeline:
             logger.warning("流水线被取消, 保存进度...")
         finally:
             await client.close()
-            await asyncio.to_thread(self.storage.finish_run, run_id, self.total, self.success, self.fail)
-            self.storage.close()
+            await self.storage.finish_run(run_id, self.total, self.success, self.fail)
+            await self.storage.close()
         elapsed = time.time() - self.started
         rate = (self.success + self.fail) / elapsed if elapsed else 0
         logger.info("流水线完成: 成功%d 失败%d 总耗时%.0fs (%.2f条/s) 风控=%s",
@@ -114,8 +116,8 @@ class Pipeline:
                     self._seen.add(num)
                     self.total += 1
                     await self.queue.put(num)
-                    await asyncio.to_thread(
-                        self.storage.upsert_search_pool, num, kw, self.cfg.city, page,
+                    await self.storage.upsert_search_pool(
+                        num, kw, self.cfg.city, page,
                         item.get("name", "") or "", item.get("companyName", "") or "",
                         item.get("salary60", "") or "")
             except Exception as e:  # noqa: BLE001
@@ -155,12 +157,12 @@ class Pipeline:
                 row["source"] = "detailv2"
                 row["raw_json"] = json.dumps(data, ensure_ascii=False)[:8000]
                 await client.report_success()
-                await asyncio.to_thread(self.storage.upsert_position, row)
+                await self.storage.upsert_position(row)
                 comp = {k: row.get(k, "") for k in
                         ("company_number", "company_name", "company_size",
                          "financing_stage", "industry_name")}
                 if comp.get("company_number"):
-                    await asyncio.to_thread(self.storage.upsert_company, comp)
+                    await self.storage.upsert_company(comp)
                 self.success += 1
             except Exception as e:  # noqa: BLE001
                 self.fail += 1

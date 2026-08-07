@@ -34,7 +34,28 @@ DETAIL_CONCURRENCY = 10          # 详情并发 worker 数
 SEARCH_CONCURRENCY = 2           # 搜索并发 worker 数 (风控敏感)
 DETAIL_RATE_PER_SEC = 8.0        # 全局限速 (请求/秒, 令牌桶跨 worker 共享)
 QUEUE_SIZE = 200                 # 队列容量 (背压)
-DB_PATH = "output/zhaopin.db"    # SQLite 入库路径 (WAL 模式)
+# ---- PostgreSQL 存储 (百万级, 隔离部署: zhilian-net, 127.0.0.1:5433) ----
+# URL 优先级: 环境变量 ZHAOPIN_DB_URL > config/db.local.json (gitignored) > 默认
+import json as _json
+import os as _os
+
+
+def _load_db_url() -> str:
+    env = _os.environ.get("ZHAOPIN_DB_URL")
+    if env:
+        return env
+    p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "db.local.json")
+    if _os.path.exists(p):
+        try:
+            return _json.load(open(p, encoding="utf-8")).get("db_url", "")
+        except Exception:
+            pass
+    return "postgresql://zhilian:zhilian@127.0.0.1:5433/zhilian"
+
+
+DB_URL = _load_db_url()          # PostgreSQL 连接串 (asyncpg)
+DB_POOL_MAX = 20                 # 连接池上限 (多 worker 并发写)
+DB_PATH = "output/zhaopin.db"    # 旧 SQLite 路径 (Phase A 遗留, 已弃用数据)
 
 # ---- Redis 分布式任务队列 (Phase B: 万级, 隔离部署) ----
 REDIS_URL = "redis://127.0.0.1:6379/0"   # 隔离的 zhilian-redis 容器 (zhilian-net, 仅本机)

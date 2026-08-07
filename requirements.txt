@@ -1,3 +1,4 @@
 curl_cffi>=0.15.0
 requests>=2.31
 redis>=5.0
+asyncpg>=0.29

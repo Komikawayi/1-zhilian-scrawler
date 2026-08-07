@@ -37,7 +37,7 @@ from utils.async_client import (
 from utils.parser import extract_initial_state, parse_position_detail_v2
 from utils.pipeline import Pipeline, PipelineConfig
 from utils.risk import RiskState
-from utils.storage import Storage
+from utils.storage_pg import AsyncStorage
 from utils.task_queue import TaskQueue
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--search-concurrency", type=int, default=settings.SEARCH_CONCURRENCY)
     ap.add_argument("--rate", type=float, default=settings.DETAIL_RATE_PER_SEC,
                     help="全局限速 请求/秒 (默认 %.1f)" % settings.DETAIL_RATE_PER_SEC)
-    ap.add_argument("--db", default=settings.DB_PATH, help="SQLite 路径 (默认 %s)" % settings.DB_PATH)
+    ap.add_argument("--db", default=settings.DB_URL, help="PostgreSQL URL (默认 %s)" % settings.DB_URL[:40] + "...")
     ap.add_argument("--export", help="采集后把 positions 导出为 CSV 路径")
     ap.add_argument("--resume", action="store_true", help="跳过已入库 number (单机流水线)")
     ap.add_argument("--name", default="", help="运行命名 (runs 表标记)")
@@ -86,9 +86,9 @@ def resolve_city(args) -> str:
 async def _amain(args) -> None:
     if not args.kw:
         if args.export:
-            storage = Storage(args.db)
-            n = storage.export_csv(args.export, "positions")
-            storage.close()
+            storage = await AsyncStorage.create(args.db)
+            n = await storage.export_csv(args.export, "positions")
+            await storage.close()
             logger.info("已导出 %d 行 -> %s", n, args.export)
             return
         logger.error("缺少 --kw, 或用 --export 仅导出")
@@ -97,15 +97,15 @@ async def _amain(args) -> None:
     cfg = PipelineConfig(
         keywords=keywords, city=resolve_city(args), pages=args.pages,
         detail_concurrency=args.concurrency, search_concurrency=args.search_concurrency,
-        detail_rate_per_sec=args.rate, db_path=args.db, resume=args.resume, name=args.name,
+        detail_rate_per_sec=args.rate, db_url=args.db, resume=args.resume, name=args.name,
     )
     logger.info("单机流水线: kw=%s city=%s pages=%d 并发=%d", keywords, cfg.city, cfg.pages, cfg.detail_concurrency)
     result = await Pipeline(cfg).run()
     logger.info("结果: %s", result)
     if args.export:
-        storage = Storage(args.db)
-        n = storage.export_csv(args.export, "positions")
-        storage.close()
+        storage = await AsyncStorage.create(args.db)
+        n = await storage.export_csv(args.export, "positions")
+        await storage.close()
         logger.info("已导出 %d 行 -> %s", n, args.export)
 
 
@@ -171,7 +171,7 @@ async def _produce(args) -> int:
 @dataclass
 class WorkerConfig:
     redis_url: str
-    db_path: str
+    db_url: str
     concurrency: int = 10
     rate_per_sec: float = 8.0
     max_attempts: int = 3
@@ -194,12 +194,12 @@ async def _consume_loop(client, queue, storage, cfg: WorkerConfig) -> Dict:
             row["position_number"] = num
             row["source"] = "detailv2"
             row["raw_json"] = json.dumps(data, ensure_ascii=False)[:8000]
-            await asyncio.to_thread(storage.upsert_position, row)
+            await storage.upsert_position(row)
             comp = {k: row.get(k, "") for k in
                     ("company_number", "company_name", "company_size",
                      "financing_stage", "industry_name")}
             if comp.get("company_number"):
-                await asyncio.to_thread(storage.upsert_company, comp)
+                await storage.upsert_company(comp)
             await queue.complete(num)
             ok += 1
         except Exception as e:  # noqa: BLE001
@@ -218,13 +218,13 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
     rate_limiter = RedisRateLimiter(queue.redis, cfg.rate_per_sec)
     risk = RiskState()
     client = AsyncZhilianClient(risk=risk, rate_limiter=rate_limiter)
-    storage = Storage(cfg.db_path)
+    storage = await AsyncStorage.create(cfg.db_url)
     try:
         coros = [_consume_loop(client, queue, storage, cfg) for _ in range(cfg.concurrency)]
         results = await asyncio.gather(*coros)
     finally:
         await client.close()
-        storage.close()
+        await storage.close()
         await queue.close()
     ok = sum(r["ok"] for r in results)
     fail = sum(r["fail"] for r in results)
@@ -239,7 +239,7 @@ def _worker_main(cfg: WorkerConfig) -> None:
 
 def _consume(args) -> None:
     workers = max(1, args.workers)
-    cfg_list = [WorkerConfig(redis_url=args.redis, db_path=args.db,
+    cfg_list = [WorkerConfig(redis_url=args.redis, db_url=args.db,
                              concurrency=args.concurrency, rate_per_sec=args.rate,
                              max_attempts=args.max_attempts, worker_id=i)
                 for i in range(workers)]
