@@ -144,7 +144,7 @@ py main.py --detail --detail-urls "https://www.zhaopin.com/jobdetail/CCL14801178
 
 ### 规模化压测结论（2026-08-07）
 
-`js_reverse_cache/probe/stress_test.py` 单 IP 顺序压测：**448 条 position-detailv2 连续采集，成功率 100%（448/448），0 挑战 0 验证码，风控全程 `ok`**（~14.6 分钟，0.54 条/s，36 字段完整）。**路线一单 IP 稳定爬取成立**（后续 Redis 分布式已 1705 条全绿）。
+`js_reverse_cache/analysis/probe/stress_test.py` 单 IP 顺序压测：**448 条 position-detailv2 连续采集，成功率 100%（448/448），0 挑战 0 验证码，风控全程 `ok`**（~14.6 分钟，0.54 条/s，36 字段完整）。**路线一单 IP 稳定爬取成立**（后续 Redis 分布式已 1705 条全绿）。
 
 > 登录态说明：路线一、路线二**均不依赖登录态**（匿名可用）。搜索 `positionCount` 恒显示 100 但实际可翻页远超 5 页（实测 p1-p8 全唯一，p=50 仍有数据）。
 
@@ -222,9 +222,10 @@ ZHAOPIN_NETWORK_TEST=1 py -m pytest tests/ -v   # 含真实网络测试
 ```text
 output/zhaopin.csv          搜索采集结果
 output/zhaopin_detail.csv   详情采集结果
-js_reverse_cache/           逆向素材 (challenge 样本 / TDC 证据 / 报告)
-js_reverse_cache/probe/     探测/压测研究脚本 (一次性)
-js_reverse_cache/tdc/       TDC 逆向脚本 (iv8 等)
+js_reverse_cache/           逆向素材 (分类: assets/analysis/data/tools/tasks)
+js_reverse_cache/assets/    原始证据素材 (js/html/network 抓包)
+js_reverse_cache/analysis/  分析脚本 (probe 探测 / tdc 逆向)
+js_reverse_cache/data/      数据字典 (search_base_data.json)
 js_reverse_cache/tasks/     任务证据目录 (zhilian-detail-tdc-001/002, risk-phase0)
 docs/                       逆向分析文档
 ```
@@ -265,12 +266,12 @@ docs/                       逆向分析文档
 侦察与验证工具在 `js_reverse_cache/`（均为一次性研究脚本，不入采集主流程，按主题归拢）：
 
 ```text
-js_reverse_cache/probe/probe_feapi.py        fe-api 纯协议对照 (随机/无参/真实参)
-js_reverse_cache/probe/e2e_detail.py         详情页 challenge 端到端验证
-js_reverse_cache/probe/probe_trigger.py      防线触发条件探测 (高频访问观察升级)
-js_reverse_cache/probe/stress_test.py        单 IP 顺序压测 (历史, 已升级为 collect.py Redis 测试)
-js_reverse_cache/probe/test_replay_cookie.py requests vs curl_cffi 重放对照
-js_reverse_cache/tdc/                        TDC 逆向 (iv8_*.py / extract_webpack_module / tdc_iv8_e2e)
+js_reverse_cache/analysis/probe/probe_feapi.py         fe-api 纯协议对照 (随机/无参/真实参)
+js_reverse_cache/analysis/probe/e2e_detail.py          详情页 challenge 端到端验证
+js_reverse_cache/analysis/probe/probe_trigger.py       防线触发条件探测 (高频访问观察升级)
+js_reverse_cache/analysis/probe/stress_test.py         单 IP 顺序压测 (历史, 已升级为 collect.py Redis 测试)
+js_reverse_cache/analysis/probe/test_replay_cookie.py  requests vs curl_cffi 重放对照
+js_reverse_cache/analysis/tdc/                         TDC 逆向 (iv8_*.py / extract_webpack_module / tdc_iv8_e2e)
 ```
 
 详细逆向过程、防线分级、TDC 协议链与踩坑记录：

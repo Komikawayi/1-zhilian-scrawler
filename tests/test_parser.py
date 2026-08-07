@@ -13,8 +13,8 @@ from utils.parser import extract_initial_state, parse_positions, parse_meta  # n
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HTML_GLOBS = [
-    os.path.join(BASE, "js_reverse_cache", "html", "*.html"),
-    os.path.join(BASE, "js_reverse_cache", "html", "curl_cffi_success.html"),
+    os.path.join(BASE, "js_reverse_cache", "assets", "html", "*.html"),
+    os.path.join(BASE, "js_reverse_cache", "assets", "html", "curl_cffi_success.html"),
 ]
 
 
