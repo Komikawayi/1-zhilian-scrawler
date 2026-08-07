@@ -13,7 +13,7 @@
 | ① 访问门控 | EdgeOne | TLS/HTTP2 指纹 (JA3/JA4) + IP 信誉 | ✅ 已还原（curl_cffi chrome）|
 | ② 详情页 | EdgeOne JS Challenge | 91-opcode VM → EO-Bot-Js-Token | ✅ 已还原（Node vm）|
 | ③ 交互验证 | TCaptcha | IP 信誉差触发，绑定浏览器指纹 | 🔬 链路已摸清，未落地 |
-| ④ 设备指纹 | **数美 Shumei** | 指纹采集 + 画像上报 → 行为打分 | 🔬 接口已抓，SDK 分析中 |
+| ④ 设备指纹 | **数美 Shumei** | 指纹采集 + 画像上报 → 行为打分 | 🔬 接口已抓；deviceSn 纯协议可生成（见 `utils/device.py`），画像加密链路未还原 |
 | ⑤ 反作弊 | **百度秒针** | miao.baidu.com/abdr | ❓ 低价值 |
 | ⑥ 行为埋点 | **神策** | sa.gif 行为事件流 | ✅ 已盘点（非风控核心）|
 | ⑦ 登录验证 | 阿里云 NoCaptcha | 登录时滑块 | ✅ 已定位端点 |
@@ -127,7 +127,7 @@ boxId = 'B' + SMID (89字符)
 
 | 机制 | 智联实测 | 证据 |
 |------|----------|------|
-| 环境一致性校验 | ⚠️ 存在（本地合成难）| deviceprofile 需 canvas/WebGL 指纹（子 agent 分析中）|
+| 环境一致性校验 | ⚠️ 存在（本地合成难）| deviceprofile 需 canvas/WebGL 指纹（RSA 加密，本地合成成本高）|
 | deviceSn 脏数据污染 | ⚠️ 存在风险 | 同一 deviceSn 纯协议高频可能被标 Bot |
 | 被动画像比对 | ⚠️ 外部查询 | 智联可向数美查 IP/UA 历史风险 |
 

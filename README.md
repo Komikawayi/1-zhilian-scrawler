@@ -176,16 +176,16 @@ py collect.py --stats                                                           
 
 **架构**：producer 搜索 SSR → 唯一 number `SADD去重+RPUSH` → Redis LIST；N 个 worker 进程 `BLPOP` 领取 → 拉详情 → **PostgreSQL**。Redis 兼任全局限速（固定窗口，跨进程共享）+ 处理中跟踪（防 worker 误退丢任务）。
 
-**Redis 隔离部署**（不碰公司服务）：
+**Redis 隔离部署**：
 ```bash
 docker network create zhilian-net
 docker run -d --name zhilian-redis --network zhilian-net -p 127.0.0.1:6379:6379 \
   -v zhilian-redis-data:/data redis:7-alpine redis-server --appendonly yes
 docker update --restart unless-stopped zhilian-redis
 ```
-独立网络 `zhilian-net`、仅绑 `127.0.0.1`（不暴露局域网）、独立卷、`appendonly` 持久化。公司服务（qincore/Spider_XHS）在其自有 default 网络，互不干扰。
+独立桥接网络 `zhilian-net`、仅绑 `127.0.0.1`（不暴露局域网）、独立数据卷、`appendonly` 持久化——与同机其他容器/服务完全隔离。
 
-**PostgreSQL 隔离部署**（百万级存储，不碰公司服务）：
+**PostgreSQL 隔离部署**（百万级存储）：
 ```bash
 docker run -d --name zhilian-postgres --network zhilian-net -p 127.0.0.1:5433:5432 \
   -e POSTGRES_USER=zhilian -e POSTGRES_PASSWORD=<pwd> -e POSTGRES_DB=zhilian \
