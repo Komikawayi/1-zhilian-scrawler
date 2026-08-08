@@ -44,7 +44,7 @@
 ```
 一键采集:      py run.py              (交互向导 → Redis 分布式自动跑)
 手动分布式:    py collect.py --produce --kw <词> --cities <码>
-               py collect.py --consume --workers N --concurrency N --search-rate 20 --detail-rate 80
+               py collect.py --consume --workers N --concurrency N --search-concurrency 10 --search-rate 20 --detail-rate 80
 公司补采:      py collect.py --produce --companies <公司号,...>
 聚合分析:      py tools/company_aggregate.py --company <公司号>
 SSR 兜底:      py main.py --detail-urls 自动过 JS Challenge (LEGACY)
@@ -68,7 +68,7 @@ run.py (一键入口: 交互配置向导 -> 自动调用 collect.py)
        PostgreSQL (positions / companies / search_pool / runs)
 
 tools/company_aggregate.py  公司岗位聚合分析 (GROUP BY company_number)
-tools/seed_config.py        配置播种 (keywords.json 28 制造词 + cities.json 370 城市)
+tools/seed_config.py        配置播种 (keywords.json 制造词 + cities.json 370 城市)
 main.py                     [LEGACY] 顺序单并发 CLI (保留 SSR 挑战兜底 --detail-urls)
 ```
 
@@ -140,7 +140,7 @@ py run.py
 py collect.py --produce --kw smt,pcba,贴片 --cities 653,530 --clear
 
 # 2. 多进程消费 (搜索 + 详情双队列, 各自独立限速桶: 搜索 20/s + 详情 80/s)
-py collect.py --consume --workers 4 --concurrency 10 --search-rate 20 --detail-rate 80
+py collect.py --consume --workers 4 --concurrency 10 --search-concurrency 10 --search-rate 20 --detail-rate 80
 
 # 3. 队列进度
 py collect.py --stats
@@ -169,9 +169,9 @@ py tools/company_aggregate.py --kw smt --export out.csv  # 关键词筛选导出
 ### 配置播种
 
 ```powershell
-py tools/seed_config.py   # 生成 config/keywords.json (28 制造词) + cities.json (370 城市)
+py tools/seed_config.py   # 生成 config/keywords.json (基础制造词) + cities.json (370 城市)
 ```
-数据来源：51job-crawler 关键词（SMT/PCBA/贴片/回流焊/AOI/SPI/锡膏…）+ 智联全城市字典。
+数据来源：51job-crawler 基础词（SMT/PCBA/贴片/回流焊/AOI/SPI/锡膏…）+ 手工补充焊锡膏客户词（SMT岗位/代工模式）至 **48 词**，当前 `keywords.json` 即全量。
 
 ### 单机调试（非分布式）
 
@@ -188,7 +188,8 @@ py main.py --detail --detail-urls "https://www.zhaopin.com/jobdetail/CCL14801178
 
 ### 规模化验证
 
-- **分桶限速压测（2026-08-08）**：30s 实测**搜索 33.5 req/s、详情 111 req/s 均 0 防线升级** → 拆独立双桶：搜索 20/s（风控敏感）+ 详情 80/s（无 IP 信誉依赖）
+- **分桶限速压测（2026-08-08）**：搜索 max 33.5 req/s、详情 111 req/s 峰值均 0 防线升级 → 拆独立双桶：搜索 20/s（风控敏感）+ 详情 80/s
+- **详情单 IP 软限（2026-08-08 复测）**：detailv2 稳定吞吐 **~70/s**（并发 10/20/30/40、纯请求/含写库实测一致）——智联对高频 detailv2 静默限速，80/s 桶实际 ~70/s；**搜索未受限**（max 32/s）
 - **分布式链路（2026-08-08）**：2 关键词页 → 31 家公司补采 → **1382 岗位 0 失败**；4 worker 压测 2282 岗位全 done；紫光未来 32/32 精确补采
 - **历史基准**：448 条顺序压测 100% 成功（0.54/s）；Phase B Redis 1705 条 100%（~114s）
 
@@ -231,10 +232,11 @@ ZHAOPIN_NETWORK_TEST=1 py -m pytest tests/ -v   # 含真实网络测试
 --companies <号>         公司号列表 (生成 company: 补采任务)
 --pages <n>              仅 --single 单机模式生效 (每关键词页数; produce 自动翻页无上限)
 --workers <n>            消费 worker 进程数
---concurrency <n>        每进程并发协程数
+--concurrency <n>        详情并发协程数/worker (默认 10, 够单IP~70/s)
+--search-concurrency <n> 搜索并发协程数/worker (默认 10, 打满 20/s 桶)
 --rate <n>               [兼容] 全局旧限速 (搜索+详情同值; 优先用分桶参数)
 --search-rate <n>        搜索桶限速 req/s (默认 20, 风控敏感)
---detail-rate <n>        详情桶限速 req/s (默认 80, 无 IP 信誉依赖)
+--detail-rate <n>        详情桶限速 req/s (默认 80; 服务器单IP软限~70/s)
 --clear                  produce 前清空对应队列
 --db <url>               PostgreSQL URL
 --redis <url>            Redis URL
@@ -243,7 +245,7 @@ ZHAOPIN_NETWORK_TEST=1 py -m pytest tests/ -v   # 含真实网络测试
 ## 运行文件
 
 ```text
-config/keywords.json        关键词宇宙 (28 制造词, 可编辑补充)
+config/keywords.json        关键词宇宙 (48 制造词: 51job 基础 28 + 焊锡膏客户词 20, 可编辑补充)
 config/cities.json          智联城市列表 (370 城市, code+name)
 config/*.local.json         本地敏感配置 (gitignored: db/session/risk/run)
 output/                     导出 CSV / 测试产物
@@ -254,6 +256,22 @@ js_reverse_cache/data/      数据字典 (search_base_data.json)
 js_reverse_cache/tasks/     任务证据目录 (tdc-001/002, risk-phase0, company-positions)
 docs/                       逆向分析文档 + 架构方案
 ```
+
+## 日志与进度
+
+采集终端默认**只显示**错误/警告 + 3 行实时进度（每秒 ANSI 刷新）：
+
+```
+[搜索] 排队   12 处理中   3 完成 48210 失败  1 | 20.0/s    [详情] 排队   8 处理中  2 完成 38124 失败 0 | 80.0/s
+[消费] 搜索:SMT工程师|杭州                    | 详情:工艺工程师|杭州
+[运行] 01:23:45   总完成 86334 总失败 1   综合 96.7/s   风控:ok
+```
+
+- 行1：搜索/详情双桶排队/处理中/完成/失败 + 各自实时速率
+- 行2：最近消费明细（搜索:关键词/公司 | 详情:岗位名|城市）
+- 行3：任务运行时间 + 总完成/失败 + 综合速率 + 风控状态
+
+**日志分级**：控制台 StreamHandler 只显示 WARNING+（UI 交给进度显示器）；**完整 INFO 日志落盘** `output/logs/collect-<时间戳>-<pid>.log`（每进程一份，避免多进程写同一文件竞争，gitignored）。排查历史问题看日志文件，终端看进度/错误。
 
 ## 时间字段语义 (positions 表)
 
