@@ -73,13 +73,15 @@ CREATE TABLE IF NOT EXISTS runs (
 
 
 def _to_raw(row: dict):
-    """raw_json 处理: 统一转为 JSON 字符串 (asyncpg jsonb codec 期望 str, 非裸 dict)。"""
+    """raw_json 处理: 统一转为 JSON 字符串 (asyncpg jsonb codec 期望 str, 非裸 dict)。
+
+    注意: 必须先截断再序列化, 不能 json.dumps 后 [:N] 截断 — 会切断字符串中间
+    产生非法 JSON (如长 jobDesc 内含引号), 导致 asyncpg InvalidTextRepresentationError。
+    """
     raw = row.get("raw_json")
     if raw is None:
         return None
-    if isinstance(raw, dict):
-        return json.dumps(raw, ensure_ascii=False)
-    if isinstance(raw, (list, tuple)):
+    if isinstance(raw, (dict, list, tuple)):
         return json.dumps(raw, ensure_ascii=False)
     return str(raw)   # 已是 JSON 字符串
 
@@ -146,6 +148,27 @@ class AsyncStorage:
                 num, str(row.get("company_name", "") or ""), str(row.get("company_size", "") or ""),
                 str(row.get("financing_stage", "") or ""), str(row.get("industry_name", "") or ""),
                 str(row.get("company_description", "") or ""))
+
+    async def upsert_company_mini(self, company_number: str, company_name: str) -> None:
+        """只写公司号+名 (搜索 worker 先落库, 供 company: 任务消费时查名)。
+
+        公司详情由详情 worker 的 upsert_company 补全; 此处 ON CONFLICT 不覆盖已有名。
+        """
+        if not company_number or not company_name:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO companies (company_number, company_name) VALUES ($1,$2) "
+                "ON CONFLICT(company_number) DO UPDATE SET "
+                "company_name=EXCLUDED.company_name, fetched_at=now()",
+                company_number, company_name)
+
+    async def get_company_name(self, company_number: str) -> str:
+        """按公司号查公司名 (company: 任务消费用); 不存在返回空串。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT company_name FROM companies WHERE company_number=$1", company_number)
+            return row["company_name"] if row else ""
 
     # ---- 查询 ----
 

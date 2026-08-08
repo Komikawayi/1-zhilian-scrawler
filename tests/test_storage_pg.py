@@ -5,11 +5,26 @@ from __future__ import annotations
 import asyncio
 
 import asyncpg
+import pytest
 
 from config import settings
 from utils.storage_pg import AsyncStorage
 
 TEST_DB = "zhilian_test"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def pg_available():
+    """PG 不可用时跳过全部存储测试 (CI/无容器环境不崩)。"""
+    async def _ping():
+        try:
+            conn = await asyncpg.connect(_base_url())
+        except Exception:
+            pytest.skip("PostgreSQL 不可用 (需启动隔离的 zhilian-postgres 容器)",
+                        allow_module_level=True)
+        else:
+            await conn.close()
+    asyncio.run(_ping())
 
 
 def _run(coro):
