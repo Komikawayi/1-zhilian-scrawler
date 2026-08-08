@@ -302,8 +302,13 @@ async def _consume_search_loop(queue, client, storage, pos_queue,
         try:
             if task_id.startswith(TASK_KEYWORD + ":"):
                 await _consume_keyword_task(queue, client, storage, pos_queue, task_id)
+                # 记录最近消费 (进度显示器读)
+                await queue.redis.set("zhaopin:last_consume:search", f"关键词 {task_id}",
+                                      ex=60)
             elif task_id.startswith(TASK_COMPANY + ":"):
                 await _consume_company_task(queue, client, storage, pos_queue, task_id)
+                await queue.redis.set("zhaopin:last_consume:search",
+                                      f"公司补采 {task_id}", ex=60)
             else:
                 raise ValueError(f"未知搜索任务类型: {task_id}")
             await queue.complete(task_id)
@@ -336,7 +341,7 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
                 return {"ok": ok, "fail": fail}
             continue
         idle_since = time.time()
-        number = task_id.split(":", 1)[1]
+        number = task_id.split(":", 1)[1] if ":" in task_id else task_id
         try:
             data = await fetch_position_detail_v2_async(client, number)
             row = parse_position_detail_v2(data)
@@ -351,6 +356,11 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
                 await storage.upsert_company(comp)
             await queue.complete(task_id)
             ok += 1
+            # 记录最近消费 (进度显示器读, 实时明细)
+            await queue.redis.set(
+                "zhaopin:last_consume:detail",
+                f"{row.get('position_name', '')[:18]}|{row.get('work_city', '')}",
+                ex=60)
         except Exception as e:  # noqa: BLE001
             fail += 1
             logger.warning("详情 %s 失败: %s", number, str(e)[:100])
@@ -376,29 +386,43 @@ async def _watchdog(search_q, pos_q, interval: float = 30.0, max_age: int = 120)
 
 async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig,
                             interval: float = 1.0) -> None:
-    """实时进度显示器: 每秒读 Redis 队列 stats, \\r 覆盖刷新单行 (不刷屏)。
+    """实时进度显示器: 每秒刷新, \\r 覆盖单行 (不刷屏)。
 
-    仅 worker0 显示 (多进程各自 print 会行竞争互相覆盖)。
-    显示: 搜索队列(排队/在途/完成/失败) + 详情队列(同) + 全局限速。
-    done/failed 从 Redis 读 (全局累计, 跨 worker 一致)。
+    仅 worker0 显示 (多进程 print 会行竞争)。
+    两行: 进度行 (搜索/详情双桶各自速率) + 消费行 (最近消费的任务明细)。
+    搜索/详情速率 = 各自 done 的每秒增量 (两个独立限速桶, 分开显示)。
     """
-    prev_done = 0
+    prev_s_done, prev_d_done = 0, 0
     prev_t = time.time()
+    printed = False
     try:
         while True:
             await asyncio.sleep(interval)
             ss = await search_q.stats()
             ps = await pos_q.stats()
+            # 最近消费明细 (各 worker 写入的 Redis key)
+            last_s = await search_q.redis.get("zhaopin:last_consume:search") or ""
+            last_d = await search_q.redis.get("zhaopin:last_consume:detail") or ""
             now = time.time()
             dt = now - prev_t
-            rate = (ps["done"] - prev_done) / dt if dt > 0 else 0
-            prev_done, prev_t = ps["done"], now
+            s_rate = (ss["done"] - prev_s_done) / dt if dt > 0 else 0
+            d_rate = (ps["done"] - prev_d_done) / dt if dt > 0 else 0
+            prev_s_done, prev_d_done, prev_t = ss["done"], ps["done"], now
             if cfg.worker_id == 0:
-                line = (f"\r[进度] 搜索:排队{ss['queue']:>5} 在途{ss['processing']:>3} "
-                        f"完成{ss['done']:>5} 失败{ss['failed']:>2} | "
-                        f"详情:排队{ps['queue']:>6} 在途{ps['processing']:>3} "
-                        f"完成{ps['done']:>6} 失败{ps['failed']:>2} | {rate:5.1f}/s   ")
-                print(line, end="", flush=True)
+                # 进度行: 搜索/详情双桶独立速率
+                line1 = (f"\r[搜索] 排队{ss['queue']:>5} 处理中{ss['processing']:>3} "
+                         f"完成{ss['done']:>6} 失败{ss['failed']:>2} | {s_rate:5.1f}/s | "
+                         f"[详情] 排队{ps['queue']:>6} 处理中{ps['processing']:>3} "
+                         f"完成{ps['done']:>6} 失败{ps['failed']:>2} | {d_rate:5.1f}/s   ")
+                # 消费行: 最近消费明细
+                line2 = (f"\r[消费] 搜索:{last_s[:28]:30s} | 详情:{last_d[:32]:34s}")
+                if printed:
+                    print("\x1b[2A" + line1, end="", flush=True)
+                    print("\n" + line2, end="", flush=True)
+                else:
+                    print(line1, end="", flush=True)
+                    print("\n" + line2, end="", flush=True)
+                    printed = True
     except asyncio.CancelledError:
         if cfg.worker_id == 0:
             print()  # 换行收尾, 避免残留半行
