@@ -350,7 +350,7 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
             logger.warning("详情 %s 失败: %s", number, str(e)[:100])
             await queue.fail(task_id, max_attempts=cfg.max_attempts)
         done = ok + fail
-        if done % 100 == 0:
+        if done % 500 == 0:
             logger.info("worker%d 详情 CHECKPOINT %d: 成功%d 失败%d",
                         cfg.worker_id, done, ok, fail)
 
@@ -368,8 +368,38 @@ async def _watchdog(search_q, pos_q, interval: float = 30.0, max_age: int = 120)
         pass
 
 
+async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig,
+                            interval: float = 1.0) -> None:
+    """实时进度显示器: 每秒读 Redis 队列 stats, \\r 覆盖刷新单行 (不刷屏)。
+
+    仅 worker0 显示 (多进程各自 print 会行竞争互相覆盖)。
+    显示: 搜索队列(排队/在途/完成/失败) + 详情队列(同) + 全局限速。
+    done/failed 从 Redis 读 (全局累计, 跨 worker 一致)。
+    """
+    prev_done = 0
+    prev_t = time.time()
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            ss = await search_q.stats()
+            ps = await pos_q.stats()
+            now = time.time()
+            dt = now - prev_t
+            rate = (ps["done"] - prev_done) / dt if dt > 0 else 0
+            prev_done, prev_t = ps["done"], now
+            if cfg.worker_id == 0:
+                line = (f"\r[进度] 搜索:排队{ss['queue']:>5} 在途{ss['processing']:>3} "
+                        f"完成{ss['done']:>5} 失败{ss['failed']:>2} | "
+                        f"详情:排队{ps['queue']:>6} 在途{ps['processing']:>3} "
+                        f"完成{ps['done']:>6} 失败{ps['failed']:>2} | {rate:5.1f}/s   ")
+                print(line, end="", flush=True)
+    except asyncio.CancelledError:
+        if cfg.worker_id == 0:
+            print()  # 换行收尾, 避免残留半行
+
+
 async def _worker_loop(cfg: WorkerConfig) -> Dict:
-    """单个 worker 进程: 搜索消费 + 详情消费 + 崩溃 watchdog, 共享全局限速。"""
+    """单个 worker 进程: 搜索消费 + 详情消费 + 崩溃 watchdog + 实时进度。"""
     search_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_SEARCH)
     pos_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_POSITION)
     rate_limiter = RedisRateLimiter(search_q.redis, cfg.rate_per_sec)
@@ -378,6 +408,7 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
     storage = await AsyncStorage.create(cfg.db_url)
     # watchdog 独立 Task: 消费 loop 全退后 cancel, 否则 gather 永不返回 (流程不收敛)
     watchdog = asyncio.create_task(_watchdog(search_q, pos_q))
+    monitor = asyncio.create_task(_progress_monitor(search_q, pos_q, cfg))
     coros = [
         _consume_search_loop(search_q, client, storage, pos_q, cfg)
         for _ in range(max(1, cfg.concurrency // 2))
@@ -390,7 +421,8 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
         results = await asyncio.gather(*coros)
     finally:
         watchdog.cancel()
-        await asyncio.gather(watchdog, return_exceptions=True)
+        monitor.cancel()
+        await asyncio.gather(watchdog, monitor, return_exceptions=True)
         await client.close()
         await storage.close()
         await search_q.close()
