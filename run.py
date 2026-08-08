@@ -1,17 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-智联采集器 — 一键运行配置脚本 (交互式向导 + 自动运行)
+智联采集器 — 一键运行配置脚本 (默认全量自动运行, 可手动定制)
 
 流程:
-  1. 交互式逐项填写 ([默认值], 回车用默认):
-     · 关键词: 逗号分隔, 或从 keywords.json 选择 (种子 28 制造词, 可自定义)
-     · 城市:   中文名或代码, 逗号分隔, 或从 cities.json 选择 (456 城市)
-     · 页数:   每关键词搜索页数
-     · 模式:   1=Redis 分布式 (默认, 推荐)  2=单机流水线
-     · [Redis] worker数 / 并发 / 限速 / 是否清池
-     · 运行命名
-  2. 打印配置摘要 + 确认 (Y/n)
-  3. 确认 → 自动运行 (城市×关键词 笛卡尔积 → produce → consume)
+  1. 启动即显示配置摘要 (默认 = 全城市 × 全关键词, 回车直接跑)
+  2. 回车确认 → 自动运行 Redis 分布式 (produce → consume)
+  3. 想定制时: 输入 n 进入手动向导 (选关键词/城市/页数/参数)
 
 机器区分: 上次配置记录 hostname, 本机与上次不一致时告警 (多台开发机区分配置)。
 """
@@ -42,8 +36,11 @@ RUN_CONF = ROOT / "config" / "run.local.json"
 KEYWORDS_CONF = ROOT / "config" / "keywords.json"
 CITIES_CONF = ROOT / "config" / "cities.json"
 
-DEFAULT_KEYWORDS = ["smt", "pcba", "贴片", "回流焊"]
-DEFAULT_CITY = "530"   # 北京
+# 默认运行参数 (与 settings 对齐; rate 按压测结论: 搜索+详情共享 15/s)
+DEFAULT_PAGES = 5
+DEFAULT_WORKERS = settings.WORKERS
+DEFAULT_CONCURRENCY = settings.DETAIL_CONCURRENCY
+DEFAULT_RATE = 15.0
 
 
 def _load_json(path: Path, default):
@@ -64,6 +61,17 @@ def _load_run_conf() -> dict:
     return _load_json(RUN_CONF, {})
 
 
+def _load_keywords() -> list:
+    """关键词: keywords.json 全量 (无则用默认制造词)。"""
+    kws = _load_json(KEYWORDS_CONF, {}).get("keywords") or []
+    return kws if kws else ["smt", "pcba", "贴片", "回流焊"]
+
+
+def _load_cities() -> list:
+    """城市: cities.json 全量 (name+code 列表)。"""
+    return _load_json(CITIES_CONF, {}).get("cities") or []
+
+
 def _prompt(label: str, default: str = "", hint: str = "") -> str:
     """交互提示: 显示 [默认值], 回车用默认。"""
     d = f"[{default}]" if default else ""
@@ -74,66 +82,22 @@ def _prompt(label: str, default: str = "", hint: str = "") -> str:
             return val
         if default:
             return default
-        if label.startswith("关键词") or label.startswith("城市"):
-            # 允许回车跳过 (后续从列表选)
-            return ""
         print("  ⚠ 必填项, 不能为空")
-
-
-def _select_from_list(title: str, items: list, multi: bool = True) -> str:
-    """从列表选择 (多选/单选), 回车返回。"""
-    print(f"\n{title} (共 {len(items)} 项):")
-    for i, it in enumerate(items[:30]):
-        print(f"  {i+1:3d}. {it}")
-    if len(items) > 30:
-        print(f"  ... 共 {len(items)} 项, 仅显示前 30")
-    while True:
-        inp = input("输入序号(逗号分隔多个, 0=全部, 回车=跳过): ").strip()
-        if not inp:
-            return ""
-        if inp == "0":
-            return ",".join(items)
-        try:
-            idxs = [int(x) - 1 for x in inp.split(",")]
-            if all(0 <= i < len(items) for i in idxs):
-                return ",".join(items[i] for i in idxs)
-        except ValueError:
-            pass
-        print("  ⚠ 序号无效, 重新输入")
-
-
-def _select_keywords() -> str:
-    """关键词: 手动输入 或 从种子列表选。"""
-    kw = _prompt("关键词", "", "逗号分隔, 如 smt,pcba,贴片")
-    if kw:
-        return kw
-    seed = _load_json(KEYWORDS_CONF, {}).get("keywords") or DEFAULT_KEYWORDS
-    print("从种子列表选择 (51job 制造词, 可编辑 config/keywords.json 补充):")
-    return _select_from_list("关键词", seed)
-
-
-def _select_cities() -> str:
-    """城市: 手动输入 或 从全城市列表选。"""
-    city = _prompt("城市", "", "中文名或代码, 逗号分隔, 如 北京,上海")
-    if city:
-        return city
-    cities = _load_json(CITIES_CONF, {}).get("cities") or []
-    names = [c["name"] for c in cities]
-    print("从智联城市列表选择 (456 城市):")
-    return _select_from_list("城市", names)
 
 
 def _confirm(conf: dict) -> bool:
     """打印配置摘要 + 确认。"""
-    print("\n" + "=" * 50)
-    print("配置摘要:")
+    print("\n" + "=" * 60)
+    print("运行配置摘要:")
     for k, v in conf.items():
         if isinstance(v, list):
-            print(f"  {k}: {', '.join(str(x) for x in v[:10])}{'...' if len(v)>10 else ''}")
+            shown = v[:10]
+            more = f" ...共 {len(v)} 项" if len(v) > 10 else ""
+            print(f"  {k}: {', '.join(str(x) for x in shown)}{more}")
         else:
             print(f"  {k}: {v}")
-    print("=" * 50)
-    ans = input("确认运行? (Y/n): ").strip().lower()
+    print("=" * 60)
+    ans = input("确认运行? (回车=运行 / n=手动定制): ").strip().lower()
     return ans in ("", "y", "yes")
 
 
@@ -162,7 +126,7 @@ def _run_redis(conf: dict) -> int:
 
 
 def _run_single(conf: dict) -> int:
-    """单机流水线 (--kw --cities 直接跑 pipeline)。"""
+    """单机流水线 (调试用)。"""
     kw = ",".join(conf["keywords"])
     cities = ",".join(conf["cities"])
     cmd = [sys.executable, str(ROOT / "collect.py"),
@@ -175,6 +139,71 @@ def _run_single(conf: dict) -> int:
     return subprocess.run(cmd).returncode
 
 
+def _default_conf() -> dict:
+    """默认全量配置: 全城市 × 全关键词。"""
+    cities = _load_cities()
+    keywords = _load_keywords()
+    return {
+        "keywords": keywords,
+        "cities": [c["code"] for c in cities],
+        "city_names": [c["name"] for c in cities],
+        "pages": DEFAULT_PAGES,
+        "mode": "redis",
+        "workers": DEFAULT_WORKERS,
+        "concurrency": DEFAULT_CONCURRENCY,
+        "rate": DEFAULT_RATE,
+        "clear": False,
+        "name": "",
+    }
+
+
+def _manual_wizard(prev: dict) -> dict:
+    """手动定制向导 (输入 n 后进入): 选关键词/城市/参数。"""
+    print("\n--- 手动定制模式 ---")
+    # 关键词: 逗号分隔 或 0=全部
+    kws = _load_keywords()
+    kw_in = _prompt("关键词", "0", "逗号分隔 或 0=全部")
+    keywords = kws if kw_in == "0" else [k.strip() for k in kw_in.split(",") if k.strip()]
+
+    # 城市: 中文名/代码 逗号分隔 或 0=全部
+    cities_all = _load_cities()
+    cities_map = {c["name"]: c["code"] for c in cities_all}
+    city_in = _prompt("城市", "0", "中文名或代码, 逗号分隔 或 0=全部")
+    if city_in == "0":
+        cities = [c["code"] for c in cities_all]
+        city_names = [c["name"] for c in cities_all]
+    else:
+        cities, city_names = [], []
+        for c in city_in.split(","):
+            c = c.strip()
+            if not c:
+                continue
+            cities.append(cities_map.get(c, c))
+            city_names.append(c)
+
+    # 页数/参数
+    pages = int(_prompt("每关键词页数", str(DEFAULT_PAGES)))
+    mode = _prompt("模式", "1", "1=Redis分布式 2=单机流水线").strip()
+    workers = int(_prompt("worker 进程数", str(DEFAULT_WORKERS)))
+    concurrency = int(_prompt("每进程并发", str(DEFAULT_CONCURRENCY)))
+    rate = float(_prompt("全局限速 req/s", str(DEFAULT_RATE)))
+    clear_in = _prompt("produce 前清空队列", "n", "y/n").lower()
+    name = _prompt("运行命名", "", "可选, 标记 runs 表")
+
+    return {
+        "keywords": keywords,
+        "cities": cities,
+        "city_names": city_names,
+        "pages": pages,
+        "mode": "single" if mode == "2" else "redis",
+        "workers": workers,
+        "concurrency": concurrency,
+        "rate": rate,
+        "clear": clear_in in ("y", "yes"),
+        "name": name,
+    }
+
+
 def main() -> int:
     # 机器区分告警
     prev = _load_run_conf()
@@ -183,58 +212,23 @@ def main() -> int:
         if input("继续? (Y/n): ").strip().lower() not in ("", "y", "yes"):
             return 0
 
-    print("=" * 50)
-    print("智联采集器一键运行向导")
-    print("=" * 50)
+    print("=" * 60)
+    print("智联采集器一键运行")
+    print("=" * 60)
 
-    # 1. 关键词
-    kw_str = _select_keywords()
-    if not kw_str:
-        print("未选择关键词, 退出"); return 0
-    keywords = [k.strip() for k in kw_str.split(",") if k.strip()]
+    conf = _default_conf()
+    if not conf["keywords"]:
+        print("❌ config/keywords.json 无关键词, 请先运行 py tools/seed_config.py")
+        return 1
+    if not conf["cities"]:
+        print("❌ config/cities.json 无城市, 请先运行 py tools/seed_config.py")
+        return 1
 
-    # 2. 城市
-    city_str = _select_cities()
-    if not city_str:
-        print("未选择城市, 退出"); return 0
-    # 中文名转代码 (cities.json), 代码直接透传
-    cities_map = {c["name"]: c["code"] for c in _load_json(CITIES_CONF, {}).get("cities", [])}
-    cities = []
-    for c in city_str.split(","):
-        c = c.strip()
-        if not c:
-            continue
-        cities.append(cities_map.get(c, c))   # 名转码, 码原样
-
-    # 3. 页数
-    pages = _prompt("每关键词页数", str(settings.DEFAULT_PAGES if hasattr(settings, "DEFAULT_PAGES") else 5))
-    try:
-        pages = max(1, int(pages))
-    except ValueError:
-        pages = 5
-
-    # 4. 模式
-    mode = _prompt("模式", "1", "1=Redis分布式 2=单机流水线").strip()
-    is_redis = mode != "2"          # 默认 Redis; 2=单机
-
-    # 5. 运行参数
-    workers = int(_prompt("worker 进程数", str(settings.WORKERS)))
-    concurrency = int(_prompt("每进程并发", str(settings.DETAIL_CONCURRENCY)))
-    rate = float(_prompt("全局限速 req/s", str(settings.DETAIL_RATE_PER_SEC)))
-    clear_in = _prompt("produce 前清空队列", "n", "y/n").lower()
-    clear = clear_in in ("y", "yes")
-    name = _prompt("运行命名", "", "可选, 标记 runs 表")
-
-    conf = {
-        "keywords": keywords, "cities": cities, "pages": pages,
-        "mode": "redis" if is_redis else "single",
-        "workers": workers, "concurrency": concurrency,
-        "rate": rate, "clear": clear, "name": name,
-    }
     if not _confirm(conf):
-        print("已取消"); return 0
+        conf = _manual_wizard(prev)
+
     _save_run_conf(conf)
-    return _run_redis(conf) if is_redis else _run_single(conf)
+    return _run_redis(conf) if conf["mode"] == "redis" else _run_single(conf)
 
 
 if __name__ == "__main__":
