@@ -32,7 +32,8 @@ TIMEOUT = 25             # 请求超时 (秒)
 # 搜索 SSR 风控敏感, 保持低频。
 DETAIL_CONCURRENCY = 10          # 详情并发 worker 数
 SEARCH_CONCURRENCY = 2           # 搜索并发 worker 数 (风控敏感)
-DETAIL_RATE_PER_SEC = 15.0       # 全局限速 (请求/秒, 搜索+详情共享同一令牌桶; 压测 0 触发防线)
+DETAIL_RATE_PER_SEC = 80.0       # 详情桶限速 (请求/秒, 实测 111/s 无风控)
+SEARCH_RATE_PER_SEC = 20.0       # 搜索桶限速 (请求/秒, IP 信誉敏感, 实测 33/s 安全)
 QUEUE_SIZE = 200                 # 队列容量 (背压)
 # ---- PostgreSQL 存储 (百万级, 隔离部署: zhilian-net, 127.0.0.1:5433) ----
 # URL 优先级: 环境变量 ZHAOPIN_DB_URL > config/db.local.json (gitignored) > 默认

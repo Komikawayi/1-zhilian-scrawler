@@ -76,10 +76,10 @@ end
 return 0
 """
 
-    def __init__(self, redis, rate_per_sec: float):
+    def __init__(self, redis, rate_per_sec: float, key: str = "zhaopin:ratelimit:sw"):
         self.redis = redis
         self.rate = max(rate_per_sec, 0.0)
-        self.key = "zhaopin:ratelimit:sw"
+        self.key = key
 
     async def acquire(self) -> None:
         if self.rate <= 0:

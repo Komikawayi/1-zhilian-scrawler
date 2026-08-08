@@ -102,7 +102,7 @@ def _confirm(conf: dict) -> bool:
 
 
 def _run_redis(conf: dict) -> int:
-    """Redis 分布式: produce (城市×关键词×页数) → consume (多进程)。"""
+    """Redis 分布式: produce (城市×关键词) → consume (多进程)。"""
     kw = ",".join(conf["keywords"])
     cities = ",".join(conf["cities"])
     # produce (keyword 任务自动翻完所有页, 无页数上限)
@@ -114,11 +114,12 @@ def _run_redis(conf: dict) -> int:
     r = subprocess.run(cmd)
     if r.returncode != 0:
         print("❌ produce 失败, 中止"); return r.returncode
-    # consume
+    # consume (分桶限速: 搜索/详情独立)
     cmd = [sys.executable, str(ROOT / "collect.py"), "--consume",
            "--workers", str(conf["workers"]),
            "--concurrency", str(conf["concurrency"]),
-           "--rate", str(conf["rate"]),
+           "--search-rate", str(conf.get("search_rate", 20)),
+           "--detail-rate", str(conf.get("detail_rate", 80)),
            "--name", conf.get("name", "")]
     print(f">>> consume: {' '.join(cmd)}")
     return subprocess.run(cmd).returncode

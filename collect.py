@@ -107,7 +107,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--concurrency", type=int, default=settings.DETAIL_CONCURRENCY,
                     help="每进程并发协程数")
     ap.add_argument("--rate", type=float, default=settings.DETAIL_RATE_PER_SEC,
-                    help="全局限速 请求/秒 (搜索+详情共享)")
+                    help="[兼容] 全局旧限速; 用 --search-rate/--detail-rate 分桶")
+    ap.add_argument("--search-rate", type=float, default=20.0,
+                    help="搜索桶限速 req/s (IP 信誉敏感, 实测 33/s 安全)")
+    ap.add_argument("--detail-rate", type=float, default=80.0,
+                    help="详情桶限速 req/s (实测 111/s 无风控)")
     ap.add_argument("--max-attempts", type=int, default=settings.MAX_ATTEMPTS,
                     help="任务失败重试次数")
     # 环境
@@ -163,7 +167,9 @@ class WorkerConfig:
     redis_url: str
     db_url: str
     concurrency: int = 10
-    rate_per_sec: float = 15.0
+    rate_per_sec: float = 15.0       # 兼容旧参数 (--rate)
+    search_rate: float = 20.0        # 搜索桶限速 (IP 信誉敏感, 实测 33/s 安全)
+    detail_rate: float = 80.0        # 详情桶限速 (实测 111/s 无风控)
     max_attempts: int = 3
     worker_id: int = 0
 
@@ -399,22 +405,28 @@ async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig,
 
 
 async def _worker_loop(cfg: WorkerConfig) -> Dict:
-    """单个 worker 进程: 搜索消费 + 详情消费 + 崩溃 watchdog + 实时进度。"""
+    """单个 worker 进程: 搜索消费 + 详情消费 + 崩溃 watchdog + 实时进度。
+
+    搜索/详情分桶限速: 搜索用 search 桶 (低频, IP 信誉敏感), 详情用 detail 桶
+    (高频, 实测无风控)。两个 client 各持自己的 rate_limiter。
+    """
     search_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_SEARCH)
     pos_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_POSITION)
-    rate_limiter = RedisRateLimiter(search_q.redis, cfg.rate_per_sec)
+    search_limiter = RedisRateLimiter(search_q.redis, cfg.search_rate, key="zhaopin:ratelimit:search")
+    detail_limiter = RedisRateLimiter(search_q.redis, cfg.detail_rate, key="zhaopin:ratelimit:detail")
     risk = RiskState()
-    client = AsyncZhilianClient(risk=risk, rate_limiter=rate_limiter)
+    search_client = AsyncZhilianClient(risk=risk, rate_limiter=search_limiter)
+    detail_client = AsyncZhilianClient(risk=risk, rate_limiter=detail_limiter)
     storage = await AsyncStorage.create(cfg.db_url)
     # watchdog 独立 Task: 消费 loop 全退后 cancel, 否则 gather 永不返回 (流程不收敛)
     watchdog = asyncio.create_task(_watchdog(search_q, pos_q))
     monitor = asyncio.create_task(_progress_monitor(search_q, pos_q, cfg))
     coros = [
-        _consume_search_loop(search_q, client, storage, pos_q, cfg)
+        _consume_search_loop(search_q, search_client, storage, pos_q, cfg)
         for _ in range(max(1, cfg.concurrency // 2))
     ]
     coros += [
-        _consume_position_loop(pos_q, client, storage, cfg, search_q=search_q)
+        _consume_position_loop(pos_q, detail_client, storage, cfg, search_q=search_q)
         for _ in range(cfg.concurrency)
     ]
     try:
@@ -423,7 +435,8 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
         watchdog.cancel()
         monitor.cancel()
         await asyncio.gather(watchdog, monitor, return_exceptions=True)
-        await client.close()
+        await search_client.close()
+        await detail_client.close()
         await storage.close()
         await search_q.close()
         await pos_q.close()
@@ -442,10 +455,11 @@ def _consume(args) -> None:
     workers = max(1, args.workers)
     cfg_list = [WorkerConfig(redis_url=args.redis, db_url=args.db,
                              concurrency=args.concurrency, rate_per_sec=args.rate,
+                             search_rate=args.search_rate, detail_rate=args.detail_rate,
                              max_attempts=args.max_attempts, worker_id=i)
                 for i in range(workers)]
-    logger.info("启动 %d 个 worker 进程 (每进程 %d 并发, 全局限速 %.1f/s, db=%s)",
-                workers, args.concurrency, args.rate, args.db)
+    logger.info("启动 %d 个 worker 进程 (每进程 %d 并发, 搜索 %.0f/s + 详情 %.0f/s, db=%s)",
+                workers, args.concurrency, args.search_rate, args.detail_rate, args.db)
     procs = [multiprocessing.Process(target=_worker_main, args=(cfg,)) for cfg in cfg_list]
     for p in procs:
         p.start()
