@@ -127,7 +127,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--single", action="store_true", help="单机流水线 (调试用, 非分布式)")
     ap.add_argument("--workers", type=int, default=settings.WORKERS, help="worker 进程数")
     ap.add_argument("--concurrency", type=int, default=settings.DETAIL_CONCURRENCY,
-                    help="每进程并发协程数")
+                    help="详情并发协程数/worker")
+    ap.add_argument("--search-concurrency", type=int, default=settings.SEARCH_CONCURRENCY,
+                    help="搜索并发协程数/worker (搜索桶 20/s 需全局 ≥12; 默认 10)")
     ap.add_argument("--rate", type=float, default=settings.DETAIL_RATE_PER_SEC,
                     help="[兼容] 全局旧限速; 用 --search-rate/--detail-rate 分桶")
     ap.add_argument("--search-rate", type=float, default=20.0,
@@ -189,6 +191,7 @@ class WorkerConfig:
     redis_url: str
     db_url: str
     concurrency: int = 10
+    search_concurrency: int = 10       # 每 worker 搜索协程数 (够打满 20/s 搜索桶)
     rate_per_sec: float = 15.0       # 兼容旧参数 (--rate)
     search_rate: float = 20.0        # 搜索桶限速 (IP 信誉敏感, 实测 33/s 安全)
     detail_rate: float = 80.0        # 详情桶限速 (实测 111/s 无风控)
@@ -478,7 +481,7 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
     monitor = asyncio.create_task(_progress_monitor(search_q, pos_q, cfg, risk=risk))
     coros = [
         _consume_search_loop(search_q, search_client, storage, pos_q, cfg)
-        for _ in range(max(1, cfg.concurrency // 2))
+        for _ in range(max(1, cfg.search_concurrency))
     ]
     coros += [
         _consume_position_loop(pos_q, detail_client, storage, cfg, search_q=search_q)
@@ -509,7 +512,9 @@ def _worker_main(cfg: WorkerConfig) -> None:
 def _consume(args) -> None:
     workers = max(1, args.workers)
     cfg_list = [WorkerConfig(redis_url=args.redis, db_url=args.db,
-                             concurrency=args.concurrency, rate_per_sec=args.rate,
+                             concurrency=args.concurrency,
+                             search_concurrency=args.search_concurrency,
+                             rate_per_sec=args.rate,
                              search_rate=args.search_rate, detail_rate=args.detail_rate,
                              max_attempts=args.max_attempts, worker_id=i)
                 for i in range(workers)]

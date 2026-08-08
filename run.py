@@ -118,6 +118,7 @@ def _run_redis(conf: dict) -> int:
     cmd = [sys.executable, str(ROOT / "collect.py"), "--consume",
            "--workers", str(conf["workers"]),
            "--concurrency", str(conf["concurrency"]),
+           "--search-concurrency", str(conf.get("search_concurrency", settings.SEARCH_CONCURRENCY)),
            "--search-rate", str(conf.get("search_rate", 20)),
            "--detail-rate", str(conf.get("detail_rate", 80)),
            "--name", conf.get("name", "")]
