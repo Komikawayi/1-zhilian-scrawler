@@ -1,6 +1,9 @@
 stages:
   - test
 
+variables:
+  CI_COMMIT_DESCRIPTION: "ci"
+
 test:
   stage: test
   script:
