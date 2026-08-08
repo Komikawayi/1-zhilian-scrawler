@@ -3,7 +3,7 @@
 智联采集器 — CLI (Redis 分布式任务队列, 搜索/详情双队列)
 
 任务流:
-  --produce   生成任务 (城市×关键词×页码 → 搜索队列 keyword: 任务;
+  --produce   生成任务 (城市×关键词 → 搜索队列 keyword: 任务, 消费自动翻页;
                           --companies 直接生成 company: 任务)
   --consume   多进程 worker 消费:
                 keyword:任务 → sou 搜索 → 岗位号入详情队列 + 公司入 companies 表
@@ -11,13 +11,14 @@
                 position:任务 → position-detailv2 → upsert PostgreSQL
   --stats     队列统计
 
-搜索与详情共享同一 Redis 全局限速 (15/s, 同一 IP 信誉资源);
+搜索/详情各自独立 Redis 滑动窗口限速桶 (默认 搜索 20/s + 详情 80/s,
+搜索风控敏感保持低频, 详情无 IP 信誉依赖可高频);
 风控状态机跨 run 持久化 (utils/risk.py)。
 
 用法:
   py collect.py --produce --kw smt,pcba --cities 653,530        # 建搜索任务池 (自动翻完所有页)
   py collect.py --produce --companies CZ883210900,CZ1425835260            # 公司名补采任务
-  py collect.py --consume --workers 4 --concurrency 10 --rate 15          # 多进程消费
+  py collect.py --consume --workers 4 --concurrency 10 --search-rate 20 --detail-rate 80  # 多进程消费
   py collect.py --stats                                                   # 队列进度
 """
 from __future__ import annotations

@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS positions (
   {pos_cols},
   source TEXT,
   raw_json JSONB,
-  fetched_at TIMESTAMPTZ DEFAULT now()
+  first_seen_at TIMESTAMPTZ,          -- 首次入库时间 (upsert 不覆盖, 存量迁移后为 NULL)
+  fetched_at TIMESTAMPTZ DEFAULT now() -- 最近采集时间 (每次 upsert 刷新)
 );
 CREATE INDEX IF NOT EXISTS idx_positions_company ON positions(company_number);
 CREATE INDEX IF NOT EXISTS idx_positions_city ON positions(city_id);
@@ -105,6 +106,9 @@ class AsyncStorage:
         cols = ",\n  ".join(f"{c} TEXT" for c in POSITION_FIELDS)
         async with self.pool.acquire() as conn:
             await conn.execute(_SCHEMA.format(pos_cols=cols))
+            # 存量表迁移: 老表无 first_seen_at 列时补上 (存量行=NULL, 诚实反映首次时间未知)
+            await conn.execute(
+                "ALTER TABLE positions ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ")
 
     # ---- 写入 ----
 
@@ -118,8 +122,12 @@ class AsyncStorage:
         vals = [str(num)] + [str(row.get(f, "") or "") for f in fields]
         vals += [str(row.get("source", "") or ""), _to_raw(row)]
         ph = ",".join(f"${i}" for i in range(1, len(cols) + 1))
+        # fetched_at 每次重采刷新 (最近采集时间);
+        # first_seen_at: INSERT 写入, 已有值不覆盖, 但存量 NULL (迁移前数据) 重采时补近似值
         updates = ",".join(f"{c}=EXCLUDED.{c}" for c in cols[1:])
-        sql = f"INSERT INTO positions ({','.join(cols)}) VALUES ({ph}) " \
+        updates += ", fetched_at=now(), " \
+                   "first_seen_at=COALESCE(positions.first_seen_at, now())"
+        sql = f"INSERT INTO positions ({','.join(cols)}, first_seen_at) VALUES ({ph}, now()) " \
               f"ON CONFLICT(position_number) DO UPDATE SET {updates}"
         async with self.pool.acquire() as conn:
             await conn.execute(sql, *vals)

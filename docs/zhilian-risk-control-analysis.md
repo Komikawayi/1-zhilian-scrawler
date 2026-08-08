@@ -13,7 +13,7 @@
 | ① 访问门控 | EdgeOne | TLS/HTTP2 指纹 (JA3/JA4) + IP 信誉 | ✅ 已还原（curl_cffi chrome）|
 | ② 详情页 | EdgeOne JS Challenge | 91-opcode VM → EO-Bot-Js-Token | ✅ 已还原（Node vm）|
 | ③ 交互验证 | TCaptcha | IP 信誉差触发，绑定浏览器指纹 | 🔬 链路已摸清，未落地 |
-| ④ 设备指纹 | **数美 Shumei** | 指纹采集 + 画像上报 → 行为打分 | 🔬 接口已抓；deviceSn 纯协议可生成（见 `utils/device.py`），画像加密链路未还原 |
+| ④ 设备指纹 | **数美 Shumei** | 指纹采集 + 画像上报 → 行为打分 | 🔬 接口已抓；deviceSn 纯协议可生成（研究已验证，实现未落地），画像加密链路未还原 |
 | ⑤ 反作弊 | **百度秒针** | miao.baidu.com/abdr | ❓ 低价值 |
 | ⑥ 行为埋点 | **神策** | sa.gif 行为事件流 | ✅ 已盘点（非风控核心）|
 | ⑦ 登录验证 | 阿里云 NoCaptcha | 登录时滑块 | ✅ 已定位端点 |
@@ -67,7 +67,7 @@ config/zhilian-session.local.json  登录凭据 (gitignored)
 用法：
 ```bash
 py tools/login_collect.py                          # 采集登录态数据
-py main.py --detail --detail-numbers "CCLxxx"      # 匿名职位详情 (无需登录)
+py main.py --detail --detail-numbers "CCLxxx"      # [LEGACY] 匿名职位详情 (无需登录; 生产走 collect.py)
 ```
 
 ## 7. 数美 SDK 深度还原结论（Phase 2b，已完成）
@@ -91,7 +91,7 @@ boxId = 'B' + SMID (89字符)
 - DES/AES/RSA/canonical/kz 全部可本地复现（Node vm 可完整跑 SDK）
 - 需要真实环境的字段（canvas/字体/WebGL）固定环境稳定，**捕获一次缓存可长期复用**
 - **deviceSn 纯协议生成已验证**：`POST reportShuMeiDevice {boxId: 任意非空}` → code=200 + 新 deviceSn（智联不校验 boxId 指纹绑定）；空 boxData 不生成
-- **落地**：`utils/device.py` `fetch_device_sn()` 纯协议生成/续期 deviceSn；采集器缓存复用（模拟 SDK 24h 行为）
+- **落地状态**：采集接口均不需 deviceSn（`x-zp-device-sn` 是 cookie 非 header，已确认不必要）；`utils/device.py` 已删除，研究验证结论保留于此
 
 ## 7.1 遗留
 

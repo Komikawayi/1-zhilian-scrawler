@@ -6,12 +6,15 @@ DP 分析: 真实 .htm 页面 SSR 数据提取 + 翻页交互穷举
 翻页交互穷举: 点击页码/下一页/滚动, 记录 URL 变化 + 新请求。
 """
 import json
+import os
 import re
 import time
 
 from DrissionPage import Chromium
 
 COMPANY_URL = "https://www.zhaopin.com/companydetail/CZL1425835260.htm"
+# 输出到本任务目录 (初始态证据归位 tasks/zhilian-company-positions/)
+OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def safe_wait(tab, count, timeout):
@@ -38,7 +41,7 @@ def main():
     if m:
         try:
             st = json.loads(m.group(1))
-            with open("js_reverse_cache/analysis/companydetail/initial_state_CZL1425835260_htm.json", "w", encoding="utf-8") as f:
+            with open(os.path.join(OUT_DIR, "initial_state_CZL1425835260_htm.json"), "w", encoding="utf-8") as f:
                 json.dump(st, f, ensure_ascii=False, indent=1)
             op = st.get("onlinePositions") or []
             print("SSR: searchPositionsCount=", st.get("searchPositionsCount"),

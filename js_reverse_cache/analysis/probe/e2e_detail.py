@@ -6,19 +6,24 @@
   3. 带 cookie 重放 -> 真实职位数据?
 
 用法:
-  py js_reverse_cache/e2e_detail.py [--url 职位详情URL] [--save-html]
+  py js_reverse_cache/analysis/probe/e2e_detail.py [--url 职位详情URL] [--save-html]
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 import time
-import os
 
 from curl_cffi import requests as cr
 
-CACHE = os.path.dirname(os.path.abspath(__file__))
+# 脚本在 analysis/probe/ 下, 上三级到 js_reverse_cache/ 根
+CACHE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+HTML_DIR = os.path.join(CACHE, "assets", "html")
+JS_DIR = os.path.join(CACHE, "assets", "js")
+for _d in (HTML_DIR, JS_DIR):
+    os.makedirs(_d, exist_ok=True)
 DETAIL = "https://www.zhaopin.com/jobdetail/CCL1480117890J40614881205.htm"
 
 
@@ -41,7 +46,7 @@ def extract_script(html):
 
 def run_node(script):
     p = subprocess.run(
-        ["node", os.path.join(CACHE, "eo_solve.js"), script],
+        ["node", os.path.join(CACHE, "tools", "eo_solve.js"), script],
         capture_output=True, text=True, timeout=30,
     )
     try:
@@ -71,19 +76,19 @@ def main():
 
     # 保存首次 challenge 样本
     ts = int(time.time())
-    with open(os.path.join(CACHE, "html", f"eo_challenge_{ts}.html"), "w", encoding="utf-8") as f:
+    with open(os.path.join(HTML_DIR, f"eo_challenge_{ts}.html"), "w", encoding="utf-8") as f:
         f.write(html)
 
     script = extract_script(html)
     if not script:
         print("提取 script 失败")
         return
-    with open(os.path.join(CACHE, "scripts", f"eo_challenge_live_{ts}.js"), "w", encoding="utf-8") as f:
+    with open(os.path.join(JS_DIR, f"eo_challenge_live_{ts}.js"), "w", encoding="utf-8") as f:
         f.write(script)
 
     # 执行 challenge
     print("\n== 执行 challenge JS ==")
-    result = run_node(os.path.join(CACHE, "scripts", f"eo_challenge_live_{ts}.js"))
+    result = run_node(os.path.join(JS_DIR, f"eo_challenge_live_{ts}.js"))
     if not result or not result.get("ok") or not result.get("token"):
         print("challenge 执行失败:", result)
         return
@@ -101,7 +106,7 @@ def main():
         is_challenge2 = "solveChallenge" in body
         print(f"  status={r.status_code} len={len(body)} 真实数据={is_data} 又遇challenge={is_challenge2}")
         if is_data:
-            with open(os.path.join(CACHE, "html", f"detail_data_{i}.html"), "w", encoding="utf-8") as f:
+            with open(os.path.join(HTML_DIR, f"detail_data_{i}.html"), "w", encoding="utf-8") as f:
                 f.write(body)
             print("  ✅ 拿到真实职位数据! 已保存 detail_data_%d.html" % i)
         elif is_challenge2:

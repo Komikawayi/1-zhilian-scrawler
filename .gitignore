@@ -20,9 +20,10 @@ config/*.local.json
 js_reverse_cache/network/resume_preview.json
 js_reverse_cache/**/shumei_smid.json
 js_reverse_cache/**/*smid*.json
+js_reverse_cache/**/*reportShuMei*.json
 
 # 侦察缓存: 保留 HTML/JS/网络样本 (artifact), 忽略敏感 cookie 快照
-js_reverse_cache/network/state_snapshot.json
+js_reverse_cache/**/state_snapshot.json
 js_reverse_cache/browser_cookies.json
 js_reverse_cache/*.png
 

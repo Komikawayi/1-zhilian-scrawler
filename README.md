@@ -43,8 +43,8 @@
 
 ```
 一键采集:      py run.py              (交互向导 → Redis 分布式自动跑)
-手动分布式:    py collect.py --produce --kw <词> --cities <码> --pages N
-               py collect.py --consume --workers N --concurrency N --rate 15
+手动分布式:    py collect.py --produce --kw <词> --cities <码>
+               py collect.py --consume --workers N --concurrency N --search-rate 20 --detail-rate 80
 公司补采:      py collect.py --produce --companies <公司号,...>
 聚合分析:      py tools/company_aggregate.py --company <公司号>
 SSR 兜底:      py main.py --detail-urls 自动过 JS Challenge (LEGACY)
@@ -56,7 +56,7 @@ SSR 兜底:      py main.py --detail-urls 自动过 JS Challenge (LEGACY)
 run.py (一键入口: 交互配置向导 -> 自动调用 collect.py)
   -> collect.py (Redis 分布式: 搜索/详情双队列, 多进程 worker)
        search 队列 (zhaopin:tasks:search)
-         keyword:城市:关键词:页码   [阶段一] 关键词搜索任务 (produce 生成)
+         keyword:城市:关键词       [阶段一] 关键词搜索任务 (自动翻完所有页, produce 生成)
          company:公司号             [阶段二] 公司名搜索补采任务
               | worker 消费 -> sou.zhaopin.com 搜索
               |  -> 岗位号入详情队列 + 公司号/名入 companies 表 + company: 任务
@@ -89,7 +89,6 @@ utils/risk.py               风控状态机 (防线分级/自适应速率/指数
 utils/http_client.py        curl_cffi chrome 指纹客户端 (同步, legacy 路径)
 utils/fe_api.py             匿名接口 (position-detailv2) + 登录态接口 + 会话过期检测
 utils/session.py            at/rt 登录会话加载/保存 (config/zhilian-session.local.json)
-utils/device.py             deviceSn 纯协议生成/续期 (预留未接入, 各采集接口不必需)
 utils/challenge.py          fetch_job_detail: SSR + JS Challenge 求解 (兜底)
 utils/parser.py             SSR 解析 (搜索 positionList + 详情 v2/SSR)
 utils/output.py             CSV 输出 (UTF-8 BOM)
@@ -137,11 +136,11 @@ py run.py
 ### 手动分布式（collect.py）
 
 ```powershell
-# 1. 生成任务池 (城市×关键词×页数 笛卡尔积)
-py collect.py --produce --kw smt,pcba,贴片 --cities 653,530 --pages 5 --clear
+# 1. 生成任务池 (城市×关键词 笛卡尔积; keyword 任务消费时自动翻完所有页)
+py collect.py --produce --kw smt,pcba,贴片 --cities 653,530 --clear
 
-# 2. 多进程消费 (搜索 + 详情双队列, 共享 15/s 限速)
-py collect.py --consume --workers 4 --concurrency 10 --rate 15
+# 2. 多进程消费 (搜索 + 详情双队列, 各自独立限速桶: 搜索 20/s + 详情 80/s)
+py collect.py --consume --workers 4 --concurrency 10 --search-rate 20 --detail-rate 80
 
 # 3. 队列进度
 py collect.py --stats
@@ -189,7 +188,7 @@ py main.py --detail --detail-urls "https://www.zhaopin.com/jobdetail/CCL14801178
 
 ### 规模化验证
 
-- **搜索高频压测（2026-08-08）**：sou 搜索 0.1s 间隔 / 15/s 令牌桶 / 4 路并发 7.7req/s **全部 0 触发防线**——搜索与详情同速率，共享 15/s 单桶
+- **分桶限速压测（2026-08-08）**：30s 实测**搜索 33.5 req/s、详情 111 req/s 均 0 防线升级** → 拆独立双桶：搜索 20/s（风控敏感）+ 详情 80/s（无 IP 信誉依赖）
 - **分布式链路（2026-08-08）**：2 关键词页 → 31 家公司补采 → **1382 岗位 0 失败**；4 worker 压测 2282 岗位全 done；紫光未来 32/32 精确补采
 - **历史基准**：448 条顺序压测 100% 成功（0.54/s）；Phase B Redis 1705 条 100%（~114s）
 
@@ -223,17 +222,19 @@ ZHAOPIN_NETWORK_TEST=1 py -m pytest tests/ -v   # 含真实网络测试
 ### collect.py 常用选项
 
 ```text
---produce                生成任务 (城市×关键词×页码 → 搜索队列)
+--produce                生成任务 (城市×关键词 → 搜索队列; 消费自动翻页)
 --consume                多进程消费 (搜索+详情双队列)
 --single                 单机流水线 (调试用)
 --stats                  队列进度
 --kw <词>                关键词 (逗号分隔多个)
 --cities <码>            多城市代码 (逗号分隔; 默认全国)
 --companies <号>         公司号列表 (生成 company: 补采任务)
---pages <n>              每关键词页数
+--pages <n>              仅 --single 单机模式生效 (每关键词页数; produce 自动翻页无上限)
 --workers <n>            消费 worker 进程数
 --concurrency <n>        每进程并发协程数
---rate <n>               全局限速 req/s (搜索+详情共享, 默认 15)
+--rate <n>               [兼容] 全局旧限速 (搜索+详情同值; 优先用分桶参数)
+--search-rate <n>        搜索桶限速 req/s (默认 20, 风控敏感)
+--detail-rate <n>        详情桶限速 req/s (默认 80, 无 IP 信誉依赖)
 --clear                  produce 前清空对应队列
 --db <url>               PostgreSQL URL
 --redis <url>            Redis URL
@@ -253,6 +254,18 @@ js_reverse_cache/data/      数据字典 (search_base_data.json)
 js_reverse_cache/tasks/     任务证据目录 (tdc-001/002, risk-phase0, company-positions)
 docs/                       逆向分析文档 + 架构方案
 ```
+
+## 时间字段语义 (positions 表)
+
+| 字段 | 语义 | 更新时机 |
+| --- | --- | --- |
+| `publish_time` | **岗位最新更新时间**（智联详情页"更新时间"）| 雇主刷新职位时变，重采时写入最新值 |
+| `first_seen_at` | **首次入库时间**（第一次采集到该岗位）| 仅首次 INSERT 写入，重采不覆盖；存量 NULL 重采时补近似值 |
+| `fetched_at` | **最近采集时间**（我们最后一次采到该岗位）| 每次重采刷新 |
+
+> **智联没有独立的"更新时间"字段** —— 详情页展示的"更新时间"即 `positionPublishTime`（浏览器实测确认）。
+> 分析用法：`publish_time > first_seen_at` 的岗位 = 入库后被雇主刷新过 → 活跃岗位筛选；
+> 三字段对比可还原"首发 → 刷新 → 重采"完整时间线。
 
 ## 限速与风控纪律
 

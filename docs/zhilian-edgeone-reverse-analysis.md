@@ -322,7 +322,7 @@ headers: x-zp-business-system:1 / x-zp-page-code:4019 / x-zp-platform:13
 
 ```
 zhilian-crawler/
-├── main.py                    # CLI: 搜索采集(--kw/--jl) + 详情采集(--detail)
+├── main.py                    # [LEGACY] CLI: 搜索采集(--kw/--jl) + 详情采集(--detail) — 已迁移 collect.py/run.py
 ├── config/settings.py
 ├── utils/
 │   ├── http_client.py         # ZhilianClient (curl_cffi chrome 指纹, 限速)
@@ -342,7 +342,7 @@ zhilian-crawler/
     └── tasks/zhilian-detail-tdc-001/ (TDC 分析证据 + report.md)
 ```
 
-用法：
+用法（main.py 为 [LEGACY] 路径，仅 SSR/挑战兜底用；生产主入口见 `py run.py` / `collect.py`）：
 ```bash
 # 搜索
 python main.py --kw python --jl 530 --pages 3
