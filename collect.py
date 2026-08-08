@@ -51,7 +51,28 @@ from utils.task_queue import (
     TaskQueue,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+def _setup_logging() -> str:
+    """日志双输出: 控制台只显示 WARNING+ (终端干净, 进度交给进度显示器),
+    文件保留 INFO 全量 (output/logs/collect-<ts>-<pid>.log, gitignore)。
+
+    每进程独立文件 (pid 后缀): multiprocessing spawn 子进程各自重新 import 本模块,
+    若共享同一文件会多进程并发写导致行交错; 按 pid 分文件无竞争且可回溯。
+    """
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, f"collect-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log")
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    console = logging.StreamHandler()
+    console.setLevel(logging.WARNING)          # 终端只留 错误/警告 (UI 交给进度显示器)
+    console.setFormatter(fmt)
+    file_h = logging.FileHandler(path, encoding="utf-8")
+    file_h.setLevel(logging.INFO)              # 文件保留完整 INFO, 便于回溯排查
+    file_h.setFormatter(fmt)
+    logging.basicConfig(level=logging.INFO, handlers=[console, file_h])
+    return path
+
+
+_LOG_FILE = _setup_logging()   # 模块级: 主进程 + 各 spawn worker 进程各建一份
 logger = logging.getLogger("collect")
 
 # 搜索 worker 空闲安全阀: 详情 worker 等这么久没新任务就退出 (防搜索全崩后永等)
@@ -142,8 +163,8 @@ async def _produce(args) -> int:
                     tid = search_q.make_keyword_task(city, kw)
                     if await search_q.enqueue(tid):
                         total += 1
-            logger.info("关键词任务已生成: %d 城市 × %d 关键词 = %d 个 (每任务自动翻完所有页)",
-                        len(cities), len(keywords), total)
+            print(f"关键词任务已生成: {len(cities)} 城市 × {len(keywords)} 关键词 "
+                  f"= {total} 个 (每任务自动翻完所有页)")
         # 2) 公司任务
         if args.companies:
             companies = [c.strip() for c in args.companies.split(",") if c.strip()]
@@ -151,7 +172,7 @@ async def _produce(args) -> int:
                 tid = search_q.make_company_task(num)
                 if await search_q.enqueue(tid):
                     total += 1
-            logger.info("公司任务已生成: %d 个", len(companies))
+            print(f"公司任务已生成: {len(companies)} 个")
         if total == 0:
             logger.warning("produce 未生成任何任务 (--kw 或 --companies 至少给一个)")
     finally:
@@ -366,10 +387,6 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
             fail += 1
             logger.warning("详情 %s 失败: %s", number, str(e)[:100])
             await queue.fail(task_id, max_attempts=cfg.max_attempts)
-        done = ok + fail
-        if done % 500 == 0:
-            logger.info("worker%d 详情 CHECKPOINT %d: 成功%d 失败%d",
-                        cfg.worker_id, done, ok, fail)
 
 
 # ---- worker 进程 ----
@@ -385,16 +402,17 @@ async def _watchdog(search_q, pos_q, interval: float = 30.0, max_age: int = 120)
         pass
 
 
-async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig,
+async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig, risk=None,
                             interval: float = 1.0) -> None:
-    """实时进度显示器: 每秒刷新, \\r 覆盖单行 (不刷屏)。
+    """实时进度显示器: 每秒刷新 3 行 (进度/消费/运行), ANSI \\x1b[3A 覆盖。
 
     仅 worker0 显示 (多进程 print 会行竞争)。
-    两行: 进度行 (搜索/详情双桶各自速率) + 消费行 (最近消费的任务明细)。
-    搜索/详情速率 = 各自 done 的每秒增量 (两个独立限速桶, 分开显示)。
+    行1: 搜索/详情双桶各自速率 (done 每秒增量);
+    行2: 最近消费明细;  行3: 任务运行时间 + 总完成/失败 + 综合速率 + 风控状态。
     """
     prev_s_done, prev_d_done = 0, 0
     prev_t = time.time()
+    started = time.time()
     printed = False
     try:
         while True:
@@ -410,19 +428,31 @@ async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig,
             d_rate = (ps["done"] - prev_d_done) / dt if dt > 0 else 0
             prev_s_done, prev_d_done, prev_t = ss["done"], ps["done"], now
             if cfg.worker_id == 0:
-                # 进度行: 搜索/详情双桶独立速率
+                # 行1: 进度 (搜索/详情双桶独立速率)
                 line1 = (f"\r[搜索] 排队{ss['queue']:>5} 处理中{ss['processing']:>3} "
                          f"完成{ss['done']:>6} 失败{ss['failed']:>2} | {s_rate:5.1f}/s | "
                          f"[详情] 排队{ps['queue']:>6} 处理中{ps['processing']:>3} "
                          f"完成{ps['done']:>6} 失败{ps['failed']:>2} | {d_rate:5.1f}/s   ")
-                # 消费行: 最近消费明细
+                # 行2: 消费明细
                 line2 = (f"\r[消费] 搜索:{last_s[:28]:30s} | 详情:{last_d[:32]:34s}")
+                # 行3: 运行时间 + 汇总
+                elapsed = now - started
+                hh, mm, ssec = int(elapsed // 3600), int(elapsed % 3600 // 60), int(elapsed % 60)
+                total_done = ss["done"] + ps["done"]
+                total_fail = ss["failed"] + ps["failed"]
+                total_rate = total_done / elapsed if elapsed > 0 else 0
+                rk = getattr(risk, "state", "") or "" if risk else ""
+                line3 = (f"\r[运行] {hh:02d}:{mm:02d}:{ssec:02d}  "
+                         f"总完成 {total_done:>7} 总失败 {total_fail:>4}  "
+                         f"综合 {total_rate:6.1f}/s  风控:{rk or 'ok'}")
                 if printed:
-                    print("\x1b[2A" + line1, end="", flush=True)
+                    print("\x1b[3A" + line1, end="", flush=True)
                     print("\n" + line2, end="", flush=True)
+                    print("\n" + line3, end="", flush=True)
                 else:
                     print(line1, end="", flush=True)
                     print("\n" + line2, end="", flush=True)
+                    print("\n" + line3, end="", flush=True)
                     printed = True
     except asyncio.CancelledError:
         if cfg.worker_id == 0:
@@ -445,7 +475,7 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
     storage = await AsyncStorage.create(cfg.db_url)
     # watchdog 独立 Task: 消费 loop 全退后 cancel, 否则 gather 永不返回 (流程不收敛)
     watchdog = asyncio.create_task(_watchdog(search_q, pos_q))
-    monitor = asyncio.create_task(_progress_monitor(search_q, pos_q, cfg))
+    monitor = asyncio.create_task(_progress_monitor(search_q, pos_q, cfg, risk=risk))
     coros = [
         _consume_search_loop(search_q, search_client, storage, pos_q, cfg)
         for _ in range(max(1, cfg.concurrency // 2))
@@ -483,13 +513,15 @@ def _consume(args) -> None:
                              search_rate=args.search_rate, detail_rate=args.detail_rate,
                              max_attempts=args.max_attempts, worker_id=i)
                 for i in range(workers)]
-    logger.info("启动 %d 个 worker 进程 (每进程 %d 并发, 搜索 %.0f/s + 详情 %.0f/s, db=%s)",
-                workers, args.concurrency, args.search_rate, args.detail_rate, args.db)
+    # 启动摘要走 stdout print (不被 WARNING 过滤, 进度显示器下方一次性显示)
+    print(f"启动 {workers} 个 worker 进程 (每进程 {args.concurrency} 并发, "
+          f"搜索 {args.search_rate:.0f}/s + 详情 {args.detail_rate:.0f}/s)")
     procs = [multiprocessing.Process(target=_worker_main, args=(cfg,)) for cfg in cfg_list]
     for p in procs:
         p.start()
     for p in procs:
         p.join()
+    print("采集完成, 日志见 output/logs/")
 
 
 async def _stats(args) -> None:
@@ -532,6 +564,7 @@ async def _amain(args) -> None:
 # ====================================================================
 
 def main() -> None:
+    print(f"采集日志: {_LOG_FILE}")
     args = parse_args()
     try:
         if args.stats:
