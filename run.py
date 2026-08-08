@@ -139,7 +139,22 @@ def _run_single(conf: dict) -> int:
 
 
 def _default_conf() -> dict:
-    """默认全量配置: 全城市 × 全关键词。"""
+    """默认配置: 优先复用上次保存的 run.local.json (同机), 否则全城市 × 全关键词。"""
+    prev = _load_run_conf()
+    if prev.get("hostname") == socket.gethostname() and prev.get("keywords") and prev.get("cities"):
+        # 复用上次配置 (hostname 同机才复用, 跨机告警后走全量)
+        return {
+            "keywords": prev["keywords"],
+            "cities": prev["cities"],
+            "city_names": prev.get("city_names", []),
+            "pages": prev.get("pages", DEFAULT_PAGES),
+            "mode": prev.get("mode", "redis"),
+            "workers": prev.get("workers", DEFAULT_WORKERS),
+            "concurrency": prev.get("concurrency", DEFAULT_CONCURRENCY),
+            "rate": prev.get("rate", DEFAULT_RATE),
+            "clear": prev.get("clear", False),
+            "name": prev.get("name", ""),
+        }
     cities = _load_cities()
     keywords = _load_keywords()
     return {
