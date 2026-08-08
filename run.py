@@ -36,11 +36,11 @@ RUN_CONF = ROOT / "config" / "run.local.json"
 KEYWORDS_CONF = ROOT / "config" / "keywords.json"
 CITIES_CONF = ROOT / "config" / "cities.json"
 
-# 默认运行参数 (与 settings 对齐; rate 按压测结论: 搜索+详情共享 15/s)
+# 默认运行参数 (与 settings 对齐)
 DEFAULT_PAGES = 5
 DEFAULT_WORKERS = settings.WORKERS
 DEFAULT_CONCURRENCY = settings.DETAIL_CONCURRENCY
-DEFAULT_RATE = 15.0
+DEFAULT_RATE = settings.DETAIL_RATE_PER_SEC
 
 
 def _load_json(path: Path, default):
@@ -105,10 +105,9 @@ def _run_redis(conf: dict) -> int:
     """Redis 分布式: produce (城市×关键词×页数) → consume (多进程)。"""
     kw = ",".join(conf["keywords"])
     cities = ",".join(conf["cities"])
-    # produce
+    # produce (keyword 任务自动翻完所有页, 无页数上限)
     cmd = [sys.executable, str(ROOT / "collect.py"), "--produce",
-           "--kw", kw, "--cities", cities,
-           "--pages", str(conf["pages"])]
+           "--kw", kw, "--cities", cities]
     if conf.get("clear"):
         cmd.append("--clear")
     print(f"\n>>> produce: {' '.join(cmd)}")

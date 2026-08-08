@@ -84,8 +84,9 @@ class TaskQueue:
     # ---- 任务 id 构造 (对外入口) ----
 
     @staticmethod
-    def make_keyword_task(city: str, kw: str, page: int) -> str:
-        return f"{TASK_KEYWORD}:{city}:{kw}:{page}"
+    def make_keyword_task(city: str, kw: str) -> str:
+        """关键词搜索任务 (每"城市×关键词"组合一个任务, 消费时自动翻完所有页)。"""
+        return f"{TASK_KEYWORD}:{city}:{kw}"
 
     @staticmethod
     def make_company_task(company_number: str) -> str:

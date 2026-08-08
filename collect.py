@@ -15,7 +15,7 @@
 风控状态机跨 run 持久化 (utils/risk.py)。
 
 用法:
-  py collect.py --produce --kw smt,pcba --cities 653,530 --pages 5        # 建搜索任务池
+  py collect.py --produce --kw smt,pcba --cities 653,530        # 建搜索任务池 (自动翻完所有页)
   py collect.py --produce --companies CZ883210900,CZ1425835260            # 公司名补采任务
   py collect.py --consume --workers 4 --concurrency 10 --rate 15          # 多进程消费
   py collect.py --stats                                                   # 队列进度
@@ -96,7 +96,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--kw", help="搜索关键词, 逗号分隔")
     ap.add_argument("--cities", help="多城市代码, 逗号分隔 (如 653,530)")
     ap.add_argument("--jl", help="单城市代码 (兼容)")
-    ap.add_argument("--pages", type=int, default=5, help="每关键词页数")
+    ap.add_argument("--pages", type=int, default=5,
+                    help="仅 --single 单机模式: 每关键词页数 (分布式自动翻完所有页)")
     ap.add_argument("--companies", help="公司号列表, 逗号分隔 (生成 company: 任务)")
     ap.add_argument("--clear", action="store_true", help="produce 前清空对应队列")
     # 消费
@@ -127,18 +128,17 @@ async def _produce(args) -> int:
         await search_q.clear()
     total = 0
     try:
-        # 1) 关键词任务: 城市×关键词×页码 笛卡尔积
+        # 1) 关键词任务: 城市×关键词 笛卡尔积 (每组合 1 个任务, 消费时自动翻完所有页)
         if args.kw:
             cities = [c.strip() for c in (args.cities or args.jl or "0").split(",") if c.strip()]
             keywords = [k.strip() for k in args.kw.split(",") if k.strip()]
             for city in cities:
                 for kw in keywords:
-                    for page in range(1, args.pages + 1):
-                        tid = search_q.make_keyword_task(city, kw, page)
-                        if await search_q.enqueue(tid):
-                            total += 1
-            logger.info("关键词任务已生成: %d 城市 × %d 关键词 × %d 页 = %d 个",
-                        len(cities), len(keywords), args.pages, total)
+                    tid = search_q.make_keyword_task(city, kw)
+                    if await search_q.enqueue(tid):
+                        total += 1
+            logger.info("关键词任务已生成: %d 城市 × %d 关键词 = %d 个 (每任务自动翻完所有页)",
+                        len(cities), len(keywords), total)
         # 2) 公司任务
         if args.companies:
             companies = [c.strip() for c in args.companies.split(",") if c.strip()]
@@ -192,27 +192,45 @@ async def _search_page_async(client, city, kw, page) -> str:
     return text
 
 
-async def _consume_keyword_task(queue, client, storage, pos_queue, task_id: str) -> None:
-    """keyword:{city}:{kw}:{page} → 搜索 → 岗位号入详情队列 + 公司号入搜索队列。"""
-    _, city, kw, page = task_id.split(":", 3)
-    html = await _search_page_async(client, city, kw, int(page))
-    state = extract_initial_state(html)
-    pl = state.get("positionList") or []
-    nums = [it.get("number") for it in pl if isinstance(it, dict) and it.get("number")]
-    if nums:
-        await pos_queue.enqueue_many(
-            pos_queue.make_position_task(n) for n in nums)
-    # 公司号+名 → companies 表 (mini), 并生成 company: 补采任务
-    for it in pl:
-        if not isinstance(it, dict):
-            continue
-        cn, name = it.get("companyNumber"), it.get("companyName")
-        if cn and name:
-            await storage.upsert_company_mini(cn, name)
-            comp_task = queue.make_company_task(cn)
-            if not await queue.is_failed(comp_task):   # 已重试超限不再拉起 (防失败风暴)
-                await queue.enqueue(comp_task)
-    logger.debug("keyword %s/%s p%s: %d 岗位入队", kw, city, page, len(nums))
+async def _consume_keyword_task(queue, client, storage, pos_queue, task_id: str,
+                                max_pages: int = 100) -> None:
+    """keyword:{city}:{kw} → 搜索(自动翻完所有页) → 岗位号入详情队列 + 公司号入搜索队列。
+
+    分页终止: 用 SSR 的 pages 字段 (总页数), 翻完为止; SSR 无 pages 时以连续空页兜底。
+    """
+    _, city, kw = task_id.split(":", 2)
+    added = 0
+    matched_pages = 0   # 连续空页计数 (SSR 无 pages 时兜底终止)
+    for page in range(1, max_pages + 1):
+        html = await _search_page_async(client, city, kw, page)
+        state = extract_initial_state(html)
+        pl = state.get("positionList") or []
+        total_pages = int(state.get("pages") or 0)
+        nums = [it.get("number") for it in pl if isinstance(it, dict) and it.get("number")]
+        if nums:
+            added += await pos_queue.enqueue_many(
+                pos_queue.make_position_task(n) for n in nums)
+        # 公司号+名 → companies 表 (mini), 并生成 company: 补采任务
+        for it in pl:
+            if not isinstance(it, dict):
+                continue
+            cn, name = it.get("companyNumber"), it.get("companyName")
+            if cn and name:
+                await storage.upsert_company_mini(cn, name)
+                comp_task = queue.make_company_task(cn)
+                if not await queue.is_failed(comp_task):   # 已重试超限不再拉起 (防失败风暴)
+                    await queue.enqueue(comp_task)
+        # 精确终止: SSR 给出总页数, 翻完为止
+        if total_pages > 0 and page >= total_pages:
+            break
+        # 兜底终止: SSR 无 pages 时, 连续空页 2 次或整页空
+        if total_pages == 0:
+            if not pl:
+                break
+            matched_pages = matched_pages + 1 if not nums else 0
+            if matched_pages >= 2:
+                break
+    logger.debug("keyword %s/%s: 翻 %d 页, %d 岗位入队", kw, city, page, added)
 
 
 async def _consume_company_task(queue, client, storage, pos_queue, task_id: str,

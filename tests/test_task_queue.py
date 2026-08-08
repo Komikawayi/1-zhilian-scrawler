@@ -158,11 +158,11 @@ def test_recover_lock_single():
 
 def test_task_id_factories():
     """任务 id 构造: 类型前缀 + 跨队列不撞。"""
-    assert TaskQueue.make_keyword_task("653", "smt", 2) == f"{TASK_KEYWORD}:653:smt:2"
+    assert TaskQueue.make_keyword_task("653", "smt") == f"{TASK_KEYWORD}:653:smt"
     assert TaskQueue.make_company_task("CZ883210900") == f"{TASK_COMPANY}:CZ883210900"
     assert TaskQueue.make_position_task("CC883210900J40880383610") == \
         f"{TASK_POSITION}:CC883210900J40880383610"
-    assert TaskQueue.task_type(TASK_KEYWORD + ":653:smt:2") == TASK_KEYWORD
+    assert TaskQueue.task_type(TASK_KEYWORD + ":653:smt") == TASK_KEYWORD
     assert TaskQueue.task_type(TASK_COMPANY + ":CZ883210900") == TASK_COMPANY
     assert TaskQueue.task_type(TASK_POSITION + ":CCLxxx") == TASK_POSITION
 
@@ -183,7 +183,7 @@ def test_dual_queue_isolated():
         sq = TaskQueue(TEST_URL, queue_type=QUEUE_SEARCH)
         pq = TaskQueue(TEST_URL, queue_type=QUEUE_POSITION)
         try:
-            kw_task = sq.make_keyword_task("653", "smt", 1)
+            kw_task = sq.make_keyword_task("653", "smt")
             pos_task = pq.make_position_task("CCLAAA")
             assert await sq.enqueue(kw_task) is True
             assert await pq.enqueue(pos_task) is True
@@ -212,7 +212,7 @@ def test_dual_queue_drained_independent():
         pq = TaskQueue(TEST_URL, queue_type=QUEUE_POSITION)
         try:
             assert await sq.is_drained() and await pq.is_drained()
-            await sq.enqueue(sq.make_keyword_task("530", "pcba", 1))
+            await sq.enqueue(sq.make_keyword_task("530", "pcba"))
             assert not await sq.is_drained()
             assert await pq.is_drained()      # 详情队列仍空
         finally:
@@ -228,7 +228,7 @@ def test_clear_scope():
         sq = TaskQueue(TEST_URL, queue_type=QUEUE_SEARCH)
         pq = TaskQueue(TEST_URL, queue_type=QUEUE_POSITION)
         try:
-            await sq.enqueue(sq.make_keyword_task("653", "smt", 1))
+            await sq.enqueue(sq.make_keyword_task("653", "smt"))
             await pq.enqueue(pq.make_position_task("CCLBBB"))
             await sq.clear()
             ss, ps = await sq.stats(), await pq.stats()
