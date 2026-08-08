@@ -82,7 +82,8 @@ tools/company_aggregate.py  公司岗位聚合分析 (按 company_number 聚合�
 tools/seed_config.py        配置播种 (51job 关键词 + 智联全城市 -> config/*.json)
 tools/login_collect.py      登录态采集 (简历/消息/投递/VIP/简历诊断)
 utils/task_queue.py         Redis 双队列 (search: keyword/company + position, 崩溃安全)
-utils/async_client.py       异步客户端 (curl_cffi AsyncSession) + 共享令牌桶/Redis 全局限速
+utils/async_client.py       异步客户端 (curl_cffi AsyncSession, curl_infos 网络分段) + 共享令牌桶/Redis 全局限速
+utils/latency_stats.py      分环节耗时统计 (实时均值 + 结束总结表, TTFB/总耗时/本地埋点)
 utils/storage_pg.py         PostgreSQL 存储层 (asyncpg 连接池, 百万级, 主存储)
 utils/pipeline.py           单机流水线 (调试用, 生产走 Redis 分布式)
 utils/risk.py               风控状态机 (防线分级/自适应速率/指数冷却/token 缓存, 跨 run 持久化)
@@ -259,17 +260,42 @@ docs/                       逆向分析文档 + 架构方案
 
 ## 日志与进度
 
-采集终端默认**只显示**错误/警告 + 3 行实时进度（每秒 ANSI 刷新）：
+采集终端默认**只显示**错误/警告 + 4 行实时进度（每秒 ANSI 刷新）：
 
 ```
 [搜索] 排队   12 处理中   3 完成 48210 失败  1 | 20.0/s    [详情] 排队   8 处理中  2 完成 38124 失败 0 | 80.0/s
 [消费] 搜索:SMT工程师|杭州                    | 详情:工艺工程师|杭州
 [运行] 01:23:45   总完成 86334 总失败 1   综合 96.7/s   风控:ok
+[延迟] 搜索 449ms(TTFB 446) | 详情 211ms(TTFB 197) | 解析 1.2ms | 入库 1.8ms
 ```
 
 - 行1：搜索/详情双桶排队/处理中/完成/失败 + 各自实时速率
 - 行2：最近消费明细（搜索:关键词/公司 | 详情:岗位名|城市）
 - 行3：任务运行时间 + 总完成/失败 + 综合速率 + 风控状态
+- 行4：分环节延迟（**累计均值**，每秒刷新；worker0 显示本进程统计，各 worker 逻辑相同故代表整体）
+
+**任务结束分环节耗时统计**：每个 worker 收敛后打印对齐统计表（终端 + 日志同步）：
+
+```
+=== worker 1 分环节耗时统计 ===
+  环节      样本  均值    p50     p95     max       (TTFB)      
+  搜索网络     128   449ms   432ms   511ms   585ms  (446ms)     
+  详情网络     812   211ms   208ms   262ms   300ms  (197ms)     
+  搜索解析     128     4ms     4ms     5ms     6ms  -           
+  详情解析     812     1ms     1ms     1ms     2ms  -           
+  详情入库     812     2ms     2ms     2ms     3ms  -           
+  搜索入库    2560     1ms     1ms     2ms     2ms  -           
+  冷却等待       2  3000ms  3000ms  3000ms  3000ms  -           
+```
+
+主进程最后输出 `采集完成: 总耗时 00:12:34, 日志见 output/logs/`。
+
+**采集指标设计理念**（完整分析见 `docs/zhilian-crawler-pipeline.md` §3/§4）：
+- **只采网络 TTFB + 总耗时**：TTFB = 服务端处理 + 1 RTT，是单请求延迟核心、直接决定并发需求（实测搜索 ~450ms / 详情 ~200ms）；总耗时 = 端到端，对应吞吐
+- **不采 DNS/TCP/TLS**：keep-alive 稳态下每连接只发生一次 ≈ 0，是链路/系统属性非采集可控，采了只会污染统计误导分析（离线深度分析用 `js_reverse_cache/analysis/probe/net_latency_probe.py`）
+- **本地埋点**（解析 / DB 写 / 冷却等待）：每次请求都发生，用于证明木桶在服务端还是本地（实测解析 1-4ms、入库 1-9ms，均远小于网络 → 木桶在服务端）
+- **生产 v2 路径无本地解密/签名**：detailv2 纯 JSON 无挑战、参数非签名，本地零计算，无需采集
+- 统计口径：均值看典型、p50 看中位、p95 看尾部最坏常态、max 抓异常——四者配合才能定位木桶，单看均值会被极端值骗
 
 **日志分级**：控制台 StreamHandler 只显示 WARNING+（UI 交给进度显示器）；**完整 INFO 日志落盘** `output/logs/collect-<时间戳>-<pid>.log`（每进程一份，避免多进程写同一文件竞争，gitignored）。排查历史问题看日志文件，终端看进度/错误。
 
