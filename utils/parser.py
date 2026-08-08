@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from html.parser import HTMLParser
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
@@ -149,6 +150,53 @@ def _pick(obj: Dict[str, Any], mapping: Dict[str, str]) -> Dict[str, str]:
     return row
 
 
+# ---- job_desc HTML 清洗 (入库纯文本, 原始 HTML 留在 raw_json 可回溯) ----
+
+class _JobDescTextExtractor(HTMLParser):
+    """HTML → 纯文本: br/块级标签转换行, 其余删标签保留文本, convert_charrefs 反转义实体。"""
+
+    _BREAK = {"br"}
+    _BLOCK = {"p", "div", "li", "ul", "ol", "h1", "h2", "h3", "h4",
+              "tr", "table", "section"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)   # &nbsp; 等实体自动反转义
+        self._parts: List[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._BREAK or tag in self._BLOCK:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self._BLOCK:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        self._parts.append(data)
+
+    def get_text(self) -> str:
+        return "".join(self._parts)
+
+
+def clean_job_desc(html: str) -> str:
+    """职位描述 HTML → 纯文本: 删标签, br/块级转换行, 实体反转义, 空白整理。
+
+    保留段落换行 (岗位职责/任职资格/1)2)3) 分行); 解析异常时原样返回不丢数据。
+    """
+    if not html:
+        return ""
+    p = _JobDescTextExtractor()
+    try:
+        p.feed(html)
+        p.close()
+        raw = p.get_text()
+    except Exception:  # noqa: BLE001  解析异常原样返回, 不丢数据
+        return html
+    # 整理: \xa0(nbsp)→空格, 每行 strip, 过滤空行 (合并连续换行), 去首尾换行
+    lines = [ln.replace("\xa0", " ").strip() for ln in raw.split("\n")]
+    return "\n".join(l for l in lines if l)
+
+
 def _parse_detail(
     dp: Dict[str, Any],
     dc: Dict[str, Any],
@@ -167,6 +215,9 @@ def _parse_detail(
         id_key / id_val: 追加的 id 字段 (SSR=job_number, v2=task_id)
     """
     row = _pick(dp, position_map)
+    # job_desc: HTML → 纯文本 (删标签保留段落换行); 原始 HTML 在 raw_json 可回溯
+    if "job_desc" in row and row["job_desc"]:
+        row["job_desc"] = clean_job_desc(row["job_desc"])
     row.update(_pick(dc, DETAIL_COMPANY_MAP))
 
     # 数组字段序列化 (v2 无 labels 时自动跳过)

@@ -311,6 +311,10 @@ docs/                       逆向分析文档 + 架构方案
 > 分析用法：`publish_time > first_seen_at` 的岗位 = 入库后被雇主刷新过 → 活跃岗位筛选；
 > 三字段对比可还原"首发 → 刷新 → 重采"完整时间线。
 
+**`job_desc` 为纯文本**：入库时已清洗 HTML 标签（`<br>`/`<div>`/`<p>`/列表 → 段落换行、实体反转义，
+见 `utils/parser.py::clean_job_desc`）；早期带 HTML 的存量行已用 `tools/clean_job_desc.py` 清洗。
+**原始 HTML 仍保留在 `raw_json` 字段**可回溯。
+
 ## 限速与风控纪律
 
 - 搜索页 + `position-detailv2`（推荐详情路径）纯协议稳定，**不受详情页 IP 信誉影响**（20/20 实测）。
