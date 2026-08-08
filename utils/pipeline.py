@@ -119,9 +119,6 @@ class Pipeline:
                 state = extract_initial_state(html)
                 self.stats.record("search_parse", time.perf_counter() - t0)
                 items = state.get("positionList") or []
-                # db_search: 仅计 search_pool upsert 耗时 (queue.put 背压阻塞不计入,
-                # 避免队列满时把数秒阻塞误标为 DB 时间, 跨模式对比失真)
-                db_t = 0.0
                 for item in items:
                     num = item.get("number") if isinstance(item, dict) else None
                     if not num or num in self._seen:
@@ -129,13 +126,6 @@ class Pipeline:
                     self._seen.add(num)
                     self.total += 1
                     await self.queue.put(num)
-                    t0 = time.perf_counter()
-                    await self.storage.upsert_search_pool(
-                        num, kw, self.cfg.city, page,
-                        item.get("name", "") or "", item.get("companyName", "") or "",
-                        item.get("salary60", "") or "")
-                    db_t += time.perf_counter() - t0
-                self.stats.record("db_search", db_t)
             except Exception as e:  # noqa: BLE001
                 logger.warning("搜索 %s p%d 失败: %s", kw, page, str(e)[:120])
             await asyncio.sleep(0.2)

@@ -57,7 +57,7 @@
 │ ⑨入库      upsert_position (positions) + upsert_company          │
 └──────────────────────────────┬─────────────────────────────────┘
                                ▼
-                         PostgreSQL (positions / companies / search_pool / runs)
+                         PostgreSQL (positions / companies / runs)
 ```
 
 **关键点**：

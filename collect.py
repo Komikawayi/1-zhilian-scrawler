@@ -420,7 +420,8 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
                 ex=60)
         except Exception as e:  # noqa: BLE001
             fail += 1
-            logger.warning("详情 %s 失败: %s", number, str(e)[:100])
+            # 终端默认只留 WARNING, 偶发 curl 断连重试会刷屏 → 只记 ERROR (final 失败)
+            logger.error("详情 %s 失败: %s", number, str(e)[:100])
             await queue.fail(task_id, max_attempts=cfg.max_attempts)
 
 
@@ -437,17 +438,56 @@ async def _watchdog(search_q, pos_q, interval: float = 30.0, max_age: int = 120)
         pass
 
 
+def _enable_windows_vt() -> bool:
+    """Windows conhost 开启 VT 处理 (ANSI 光标/颜色解析)。返回是否成功启用。
+
+    colorama 同款做法: SetConsoleMode 设 ENABLE_VIRTUAL_TERMINAL_PROCESSING。
+    非 Windows / 非控制台 (管道, PyCharm Run 窗口) 返回 False → 走单行 \r 降级。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h_out = k32.GetStdHandle(-11)           # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if k32.GetConsoleMode(h_out, ctypes.byref(mode)):
+            k32.SetConsoleMode(h_out, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig, risk=None,
                             stats: LatencyStats = None,
                             interval: float = 1.0) -> None:
     """实时进度显示器: 每秒刷新 4 行 (进度/消费/运行/延迟), ANSI \\x1b[4A 覆盖。
 
-    仅 worker0 显示 (多进程 print 会行竞争)。
-    行1: 搜索/详情双桶各自速率 (done 每秒增量);
-    行2: 最近消费明细;  行3: 任务运行时间 + 总完成/失败 + 综合速率 + 风控状态;
+    仅 worker0 显示 (多进程 print 会行竞争); 仅当 stdout 为 tty 且未禁用时启用
+    ANSI 刷新 (重定向/管道/不支持 ANSI 的终端会逐行追加成长流水线, 用
+    ZHAOPIN_PROGRESS=0 强制关闭, =1 强制开启, 默认自动检测 isatty)。
+    完成/失败显示**本次运行增量**: Redis done/failed 是历史累积 SCARD,
+    启动时记录基线, 增量 = 当前 - 基线 (不含之前几万条历史)。
     行4: 分环节延迟 (累计均值, 本 worker 统计代表整体; 见 utils/latency_stats.py)。
+
+    降级分支 (非 ANSI): 每秒 \r 回行首覆盖同一行 → 实时更新且不刷屏,
+    仅占终端一行, 其余空间留给 WARNING 日志。适合 PyCharm/捕获环境。
     """
-    prev_s_done, prev_d_done = 0, 0
+    _env = os.environ.get("ZHAOPIN_PROGRESS", "").lower()
+    if _env == "0":
+        use_ansi = False
+    elif _env == "1":
+        use_ansi = True
+    elif os.environ.get("PYCHARM_HOSTED") or not sys.stdout.isatty():
+        use_ansi = False          # PyCharm Run 窗口 / 重定向 → 单行 \r 降级 (不依赖 ANSI)
+    else:
+        # Unix/Git Bash/PyCharm Terminal 带 TERM; Windows conhost 尝试启用 VT → 4 行覆盖
+        term = os.environ.get("TERM") or ""
+        use_ansi = (bool(term) and term != "dumb") or _enable_windows_vt()
+    prev_s_done = prev_d_done = None       # 上次刷新 done (滚动, 算速率)
+    base_s_done = base_d_done = None       # 本次运行基线 (增量起点)
+    base_s_fail = base_d_fail = 0
     prev_t = time.time()
     started = time.time()
     printed = False
@@ -460,23 +500,35 @@ async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig, risk=None,
             last_s = await search_q.redis.get("zhaopin:last_consume:search") or ""
             last_d = await search_q.redis.get("zhaopin:last_consume:detail") or ""
             now = time.time()
+            # 首循环: 记录本次运行基线 (Redis done/failed 是历史累积, 增量=当前-基线)
+            if base_s_done is None:
+                base_s_done, base_d_done = ss["done"], ps["done"]
+                base_s_fail, base_d_fail = ss["failed"], ps["failed"]
+                prev_s_done, prev_d_done = base_s_done, base_d_done
+                prev_t = now
+                continue
             dt = now - prev_t
+            s_done = ss["done"] - base_s_done     # 本次运行累计完成 (不含历史)
+            d_done = ps["done"] - base_d_done
+            s_fail = ss["failed"] - base_s_fail
+            d_fail = ps["failed"] - base_d_fail
             s_rate = (ss["done"] - prev_s_done) / dt if dt > 0 else 0
             d_rate = (ps["done"] - prev_d_done) / dt if dt > 0 else 0
-            prev_s_done, prev_d_done, prev_t = ss["done"], ps["done"], now
-            if cfg.worker_id == 0:
-                # 行1: 进度 (搜索/详情双桶独立速率)
+            prev_s_done, prev_d_done = ss["done"], ps["done"]
+            prev_t = now
+            if cfg.worker_id == 0 and use_ansi:
+                # 行1: 进度 (搜索/详情双桶独立速率, 本次运行增量)
                 line1 = (f"\r[搜索] 排队{ss['queue']:>5} 处理中{ss['processing']:>3} "
-                         f"完成{ss['done']:>6} 失败{ss['failed']:>2} | {s_rate:5.1f}/s | "
+                         f"完成{s_done:>6} 失败{s_fail:>2} | {s_rate:5.1f}/s | "
                          f"[详情] 排队{ps['queue']:>6} 处理中{ps['processing']:>3} "
-                         f"完成{ps['done']:>6} 失败{ps['failed']:>2} | {d_rate:5.1f}/s   ")
+                         f"完成{d_done:>6} 失败{d_fail:>2} | {d_rate:5.1f}/s   ")
                 # 行2: 消费明细
                 line2 = (f"\r[消费] 搜索:{last_s[:28]:30s} | 详情:{last_d[:32]:34s}")
-                # 行3: 运行时间 + 汇总
+                # 行3: 运行时间 + 汇总 (本次增量)
                 elapsed = now - started
                 hh, mm, ssec = int(elapsed // 3600), int(elapsed % 3600 // 60), int(elapsed % 60)
-                total_done = ss["done"] + ps["done"]
-                total_fail = ss["failed"] + ps["failed"]
+                total_done = s_done + d_done
+                total_fail = s_fail + d_fail
                 total_rate = total_done / elapsed if elapsed > 0 else 0
                 rk = getattr(risk, "state", "") or "" if risk else ""
                 line3 = (f"\r[运行] {hh:02d}:{mm:02d}:{ssec:02d}  "
@@ -500,8 +552,27 @@ async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig, risk=None,
                     print("\n" + line3, end="", flush=True)
                     print("\n" + line4, end="", flush=True)
                     printed = True
+            elif cfg.worker_id == 0:
+                # 单行降级 (不依赖 ANSI, conhost 也支持 \r): 每秒 \r 回行首覆盖同一行,
+                # 该行包含完整双桶水位 (排队/处理中/完成/失败/速率) + 运行汇总,
+                # 实时更新且不刷屏。适合 PyCharm/捕获环境 (与 4 行 ANSI 同样信息量)。
+                elapsed = now - started
+                hh, mm, ssec = int(elapsed // 3600), int(elapsed % 3600 // 60), int(elapsed % 60)
+                total_done = s_done + d_done
+                total_fail = s_fail + d_fail
+                total_rate = total_done / elapsed if elapsed > 0 else 0
+                rk = getattr(risk, "state", "") or "" if risk else ""
+                line = (f"\r[运行] {hh:02d}:{mm:02d}:{ssec:02d} "
+                        f"[搜索] 排队{ss['queue']:>5} 处理中{ss['processing']:>3} "
+                        f"完成{s_done:>6} 失败{s_fail:>2} {s_rate:5.1f}/s | "
+                        f"[详情] 排队{ps['queue']:>6} 处理中{ps['processing']:>3} "
+                        f"完成{d_done:>6} 失败{d_fail:>2} {d_rate:5.1f}/s | "
+                        f"总完成{total_done} 总失败{total_fail} 综合{total_rate:.1f}/s "
+                        f"风控:{rk or 'ok'}")
+                print(line.ljust(120), end="", flush=True)
+                printed = True
     except asyncio.CancelledError:
-        if cfg.worker_id == 0:
+        if cfg.worker_id == 0 and printed:
             print()  # 换行收尾, 避免残留半行
 
 

@@ -56,7 +56,7 @@ def _clear_tables(url):
     async def _():
         s = await AsyncStorage.create(url)
         try:
-            for t in ("positions", "companies", "search_pool", "runs"):
+            for t in ("positions", "companies", "runs"):
                 await s.pool.execute(f'TRUNCATE TABLE {t}')
         finally:
             await s.close()

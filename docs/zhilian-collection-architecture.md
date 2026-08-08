@@ -44,7 +44,6 @@
 |----|------|------|------|
 | `positions` | 岗位主表（PK `position_number`，索引 `company_number`/`city_id`/`fetched_at`）| ✅ 已有 | 无 |
 | `companies` | 公司去重表（PK `company_number`）| ✅ 已有 | **+索引 `company_name`**（阶段二按名搜索用）|
-| `search_pool` | 命中记录（岗位×关键词/公司名）| ✅ 已有 | 无 |
 | `runs` | 运行统计 | ✅ 已有 | 无 |
 
 **设计决策：不建 `company_positions` 映射表。**

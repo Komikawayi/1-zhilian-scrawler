@@ -65,7 +65,7 @@ run.py (一键入口: 交互配置向导 -> 自动调用 collect.py)
          position:岗位号            [详情] position-detailv2 JSON API
               | worker 消费 -> fe-api/c/i/jobs/position-detailv2?number=
               v
-       PostgreSQL (positions / companies / search_pool / runs)
+       PostgreSQL (positions / companies / runs)
 
 tools/company_aggregate.py  公司岗位聚合分析 (GROUP BY company_number)
 tools/seed_config.py        配置播种 (keywords.json 制造词 + cities.json 370 城市)
@@ -98,6 +98,7 @@ tools/eo_solve.js           Node vm 挑战执行器 (SSR 兜底路径用)
 
 > 📄 风控机制分析（登录态/行为信号/心跳/请求节奏/数美）见 **[docs/zhilian-risk-control-analysis.md](docs/zhilian-risk-control-analysis.md)**。
 > 📄 采集架构方案（百万级 + 公司维度聚合 + Redis 双队列设计）见 **[docs/zhilian-collection-architecture.md](docs/zhilian-collection-architecture.md)**。
+> 📄 数据分析基线（脏数据形态 + 目标公司筛选方法论 + 焊锡膏潜在客户）见 **[docs/zhilian-data-analysis.md](docs/zhilian-data-analysis.md)**。
 
 ## 登录态采集（需智联账号）
 
@@ -263,16 +264,21 @@ docs/                       逆向分析文档 + 架构方案
 采集终端默认**只显示**错误/警告 + 4 行实时进度（每秒 ANSI 刷新）：
 
 ```
-[搜索] 排队   12 处理中   3 完成 48210 失败  1 | 20.0/s    [详情] 排队   8 处理中  2 完成 38124 失败 0 | 80.0/s
+[搜索] 排队   12 处理中   3 完成  412  失败  1 | 20.0/s    [详情] 排队   8 处理中  2 完成 1834 失败 0 | 80.0/s
 [消费] 搜索:SMT工程师|杭州                    | 详情:工艺工程师|杭州
-[运行] 01:23:45   总完成 86334 总失败 1   综合 96.7/s   风控:ok
+[运行] 00:23:45   总完成 2246 总失败 1   综合 96.7/s   风控:ok
 [延迟] 搜索 449ms(TTFB 446) | 详情 211ms(TTFB 197) | 解析 1.2ms | 入库 1.8ms
 ```
 
-- 行1：搜索/详情双桶排队/处理中/完成/失败 + 各自实时速率
+- 行1：搜索/详情双桶排队/处理中/完成/失败 + 各自实时速率（**完成/失败为本次运行增量**，Redis done/failed 历史累积已由启动基线排除）
 - 行2：最近消费明细（搜索:关键词/公司 | 详情:岗位名|城市）
-- 行3：任务运行时间 + 总完成/失败 + 综合速率 + 风控状态
+- 行3：任务运行时间 + 总完成/失败 + 综合速率 + 风控状态（同样为本次增量）
 - 行4：分环节延迟（**累计均值**，每秒刷新；worker0 显示本进程统计，各 worker 逻辑相同故代表整体）
+
+> ANSI 4 行覆盖仅在 stdout 为 tty 时启用；**PyCharm Run 窗口**（`PYCHARM_HOSTED=1`）、
+> 重定向/管道不支持 ANSI 多行光标覆盖（`\x1b[4A`），会自动禁用避免长流水线。
+> **要实时进度请用 PyCharm 底部 Terminal 或 Windows Terminal 运行采集**；
+> 环境变量 `ZHAOPIN_PROGRESS=0` 强制关、`=1` 强制开。
 
 **任务结束分环节耗时统计**：每个 worker 收敛后打印对齐统计表（终端 + 日志同步）：
 

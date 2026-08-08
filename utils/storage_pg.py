@@ -50,14 +50,6 @@ CREATE INDEX IF NOT EXISTS idx_positions_company ON positions(company_number);
 CREATE INDEX IF NOT EXISTS idx_positions_city ON positions(city_id);
 CREATE INDEX IF NOT EXISTS idx_positions_fetched ON positions(fetched_at);
 
-CREATE TABLE IF NOT EXISTS search_pool (
-  number TEXT PRIMARY KEY,
-  keyword TEXT, city TEXT, page INT,
-  position_name TEXT, company_name TEXT, salary_display TEXT,
-  fetched_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_search_keyword ON search_pool(keyword, city);
-
 CREATE TABLE IF NOT EXISTS companies (
   company_number TEXT PRIMARY KEY,
   company_name TEXT, company_size TEXT, financing_stage TEXT,
@@ -131,15 +123,6 @@ class AsyncStorage:
               f"ON CONFLICT(position_number) DO UPDATE SET {updates}"
         async with self.pool.acquire() as conn:
             await conn.execute(sql, *vals)
-
-    async def upsert_search_pool(self, number, keyword, city, page,
-                                 title="", company="", salary="") -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO search_pool (number, keyword, city, page, position_name, company_name, salary_display) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7) "
-                "ON CONFLICT(number) DO UPDATE SET fetched_at=now()",
-                number, keyword, city, page, title, company, salary)
 
     async def upsert_company(self, row: Dict[str, str]) -> None:
         num = row.get("company_number")
