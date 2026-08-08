@@ -21,10 +21,15 @@ import uuid
 from typing import Optional
 
 from curl_cffi import requests as cffi_requests
+from curl_cffi.const import CurlInfo
 
 from config import settings
+from utils.latency_stats import LatencyStats
 
 logger = logging.getLogger(__name__)
+
+# 网络请求要采集的 CURLINFO 分段 (只取这两个; 不采 DNS/TCP/TLS, keep-alive 稳态无意义)
+_NET_INFOS = [CurlInfo.STARTTRANSFER_TIME, CurlInfo.TOTAL_TIME]
 
 
 class AsyncRateLimiter:
@@ -103,13 +108,19 @@ class AsyncZhilianClient:
         rate_limiter: Optional[AsyncRateLimiter] = None,
         retries: Optional[int] = None,
         timeout: Optional[int] = None,
+        stats: Optional[LatencyStats] = None,
+        name: str = "",
     ) -> None:
         self.impersonate = impersonate
         self.risk = risk
         self.rate_limiter = rate_limiter
         self.retries = retries or settings.RETRIES
         self.timeout = timeout or settings.TIMEOUT
-        self.session = cffi_requests.AsyncSession(impersonate=impersonate)
+        self.stats = stats
+        self.name = name            # 统计 stage: "search" / "detail"
+        # curl_infos: 每个响应自动携带 TTFB + 总耗时 (requests 层行为不变)
+        self.session = cffi_requests.AsyncSession(impersonate=impersonate,
+                                                  curl_infos=_NET_INFOS)
 
     async def get(self, url: str, **kw) -> cffi_requests.Response:
         return await self._request("get", url, **kw)
@@ -120,13 +131,24 @@ class AsyncZhilianClient:
     async def _request(self, method: str, url: str, **kw) -> cffi_requests.Response:
         """统一入口: 冷却阻塞 → 限速 → 请求 → 重试。"""
         if self.risk is not None:
+            t0 = time.perf_counter()
             await self.risk.async_await_cooldown()
+            if self.stats is not None:
+                dt = time.perf_counter() - t0
+                if dt > 0.01:   # 忽略正常无冷却; 仅记录实际触发冷却的等待 (>10ms)
+                    self.stats.record("cooldown", dt)
         if self.rate_limiter is not None:
             await self.rate_limiter.acquire()
         last_err: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
             try:
-                return await getattr(self.session, method)(url, timeout=self.timeout, **kw)
+                resp = await getattr(self.session, method)(url, timeout=self.timeout, **kw)
+                if self.stats is not None and self.name:
+                    infos = getattr(resp, "infos", None) or {}
+                    self.stats.record_net(self.name,
+                                          infos.get(CurlInfo.TOTAL_TIME),
+                                          infos.get(CurlInfo.STARTTRANSFER_TIME))
+                return resp
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 logger.warning("async %s %s attempt %d/%d 失败: %s",

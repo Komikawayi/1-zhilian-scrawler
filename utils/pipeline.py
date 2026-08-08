@@ -26,6 +26,7 @@ from typing import Dict, List
 from utils.async_client import (
     AsyncRateLimiter, AsyncZhilianClient, fetch_position_detail_v2_async,
 )
+from utils.latency_stats import LatencyStats
 from utils.parser import extract_initial_state, parse_position_detail_v2
 from utils.risk import RiskState
 from utils.storage_pg import AsyncStorage
@@ -55,6 +56,7 @@ class Pipeline:
         self.storage: AsyncStorage = None
         self.risk = RiskState()
         self.rate_limiter = AsyncRateLimiter(cfg.detail_rate_per_sec)
+        self.stats = LatencyStats()   # 分环节耗时统计 (结束总结)
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=cfg.queue_size)
         self.total = 0          # 入队 number 数 (搜索池唯一)
         self.success = 0
@@ -76,20 +78,26 @@ class Pipeline:
                   "concurrency": self.cfg.detail_concurrency, "resume": self.cfg.resume,
                   "name": self.cfg.name}
         run_id = await self.storage.start_run("pipeline", params)
-        client = AsyncZhilianClient(risk=self.risk, rate_limiter=self.rate_limiter)
+        # 搜索/详情各一个 client (name 区分统计 stage), 共享同一限速器
+        search_client = AsyncZhilianClient(risk=self.risk, rate_limiter=self.rate_limiter,
+                                           stats=self.stats, name="search")
+        detail_client = AsyncZhilianClient(risk=self.risk, rate_limiter=self.rate_limiter,
+                                           stats=self.stats, name="detail")
         try:
-            producers = [asyncio.create_task(self._search_worker(client, kw))
+            producers = [asyncio.create_task(self._search_worker(search_client, kw))
                          for kw in self.cfg.keywords]
-            consumers = [asyncio.create_task(self._detail_worker(client))
+            consumers = [asyncio.create_task(self._detail_worker(detail_client))
                          for _ in range(self.cfg.detail_concurrency)]
             await asyncio.gather(*producers)
             for _ in consumers:
                 await self.queue.put(None)          # 哨兵: 通知消费者收尾
             await asyncio.gather(*consumers)
+            self.stats.print_summary(0)             # 结束总结
         except asyncio.CancelledError:
             logger.warning("流水线被取消, 保存进度...")
         finally:
-            await client.close()
+            await search_client.close()
+            await detail_client.close()
             await self.storage.finish_run(run_id, self.total, self.success, self.fail)
             await self.storage.close()
         elapsed = time.time() - self.started
@@ -107,8 +115,13 @@ class Pipeline:
         for page in range(1, self.cfg.pages + 1):
             try:
                 html = await self._search_page(client, kw, self.cfg.city, page)
+                t0 = time.perf_counter()
                 state = extract_initial_state(html)
+                self.stats.record("search_parse", time.perf_counter() - t0)
                 items = state.get("positionList") or []
+                # db_search: 仅计 search_pool upsert 耗时 (queue.put 背压阻塞不计入,
+                # 避免队列满时把数秒阻塞误标为 DB 时间, 跨模式对比失真)
+                db_t = 0.0
                 for item in items:
                     num = item.get("number") if isinstance(item, dict) else None
                     if not num or num in self._seen:
@@ -116,10 +129,13 @@ class Pipeline:
                     self._seen.add(num)
                     self.total += 1
                     await self.queue.put(num)
+                    t0 = time.perf_counter()
                     await self.storage.upsert_search_pool(
                         num, kw, self.cfg.city, page,
                         item.get("name", "") or "", item.get("companyName", "") or "",
                         item.get("salary60", "") or "")
+                    db_t += time.perf_counter() - t0
+                self.stats.record("db_search", db_t)
             except Exception as e:  # noqa: BLE001
                 logger.warning("搜索 %s p%d 失败: %s", kw, page, str(e)[:120])
             await asyncio.sleep(0.2)
@@ -152,17 +168,21 @@ class Pipeline:
                 break
             try:
                 data = await fetch_position_detail_v2_async(client, num)
+                t0 = time.perf_counter()
                 row = parse_position_detail_v2(data)
+                self.stats.record("detail_parse", time.perf_counter() - t0)
                 row["position_number"] = num
                 row["source"] = "detailv2"
                 row["raw_json"] = json.dumps(data, ensure_ascii=False)[:8000]
                 await client.report_success()
+                t0 = time.perf_counter()
                 await self.storage.upsert_position(row)
                 comp = {k: row.get(k, "") for k in
                         ("company_number", "company_name", "company_size",
                          "financing_stage", "industry_name")}
                 if comp.get("company_number"):
                     await self.storage.upsert_company(comp)
+                self.stats.record("db_detail", time.perf_counter() - t0)
                 self.success += 1
             except Exception as e:  # noqa: BLE001
                 self.fail += 1

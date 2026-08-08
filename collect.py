@@ -42,6 +42,7 @@ from utils.async_client import (
     AsyncRateLimiter, AsyncZhilianClient, RedisRateLimiter,
     fetch_position_detail_v2_async,
 )
+from utils.latency_stats import LatencyStats
 from utils.parser import extract_initial_state, parse_position_detail_v2
 from utils.pipeline import Pipeline, PipelineConfig
 from utils.risk import RiskState
@@ -77,6 +78,12 @@ logger = logging.getLogger("collect")
 
 # 搜索 worker 空闲安全阀: 详情 worker 等这么久没新任务就退出 (防搜索全崩后永等)
 IDLE_EXIT_SEC = 600
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    """秒 → HH:MM:SS (任务总耗时显示)。"""
+    hh, mm, ss = int(seconds // 3600), int(seconds % 3600 // 60), int(seconds % 60)
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
 # raw_json 截断: 单字段上限 + 整体预算 (先截字段再序列化, 保证 jsonb 合法)
 RAW_JSON_MAX = 8000          # 单字段截断上限 (字符)
@@ -224,6 +231,7 @@ async def _search_page_async(client, city, kw, page) -> str:
 
 
 async def _consume_keyword_task(queue, client, storage, pos_queue, task_id: str,
+                                stats: LatencyStats = None,
                                 max_pages: int = 100) -> None:
     """keyword:{city}:{kw} → 搜索(自动翻完所有页) → 岗位号入详情队列 + 公司号入搜索队列。
 
@@ -234,20 +242,32 @@ async def _consume_keyword_task(queue, client, storage, pos_queue, task_id: str,
     matched_pages = 0   # 连续空页计数 (SSR 无 pages 时兜底终止)
     for page in range(1, max_pages + 1):
         html = await _search_page_async(client, city, kw, page)
+        t0 = time.perf_counter()
         state = extract_initial_state(html)
+        if stats is not None:
+            stats.record("search_parse", time.perf_counter() - t0)
         pl = state.get("positionList") or []
         total_pages = int(state.get("pages") or 0)
         nums = [it.get("number") for it in pl if isinstance(it, dict) and it.get("number")]
         if nums:
             added += await pos_queue.enqueue_many(
                 pos_queue.make_position_task(n) for n in nums)
-        # 公司号+名 → companies 表 (mini), 并生成 company: 补采任务
+        # 公司号+名 → companies 表 (mini), 计 db_search (页级聚合)
+        t0 = time.perf_counter()
         for it in pl:
             if not isinstance(it, dict):
                 continue
             cn, name = it.get("companyNumber"), it.get("companyName")
             if cn and name:
                 await storage.upsert_company_mini(cn, name)
+        if stats is not None:
+            stats.record("db_search", time.perf_counter() - t0)
+        # 生成 company: 补采任务 (Redis 队列操作本地快, 不计入统计)
+        for it in pl:
+            if not isinstance(it, dict):
+                continue
+            cn, name = it.get("companyNumber"), it.get("companyName")
+            if cn and name:
                 comp_task = queue.make_company_task(cn)
                 if not await queue.is_failed(comp_task):   # 已重试超限不再拉起 (防失败风暴)
                     await queue.enqueue(comp_task)
@@ -265,6 +285,7 @@ async def _consume_keyword_task(queue, client, storage, pos_queue, task_id: str,
 
 
 async def _consume_company_task(queue, client, storage, pos_queue, task_id: str,
+                                stats: LatencyStats = None,
                                 max_pages: int = 50) -> None:
     """company:{number} → 公司名搜索(全国) → 该公司全部岗位号入详情队列。
 
@@ -280,7 +301,10 @@ async def _consume_company_task(queue, client, storage, pos_queue, task_id: str,
     matched_pages = 0   # 连续"无目标公司岗位"页计数 (SSR 无 pages 时兜底终止)
     for page in range(1, max_pages + 1):
         html = await _search_page_async(client, "0", company_name, page)
+        t0 = time.perf_counter()
         state = extract_initial_state(html)
+        if stats is not None:
+            stats.record("search_parse", time.perf_counter() - t0)
         pl = state.get("positionList") or []
         total_pages = int(state.get("pages") or 0)
         page_matched = 0
@@ -310,7 +334,7 @@ async def _consume_company_task(queue, client, storage, pos_queue, task_id: str,
 
 
 async def _consume_search_loop(queue, client, storage, pos_queue,
-                               cfg: WorkerConfig) -> Dict:
+                               cfg: WorkerConfig, stats: LatencyStats = None) -> Dict:
     """搜索队列消费协程: keyword:/company: 任务 → 产出详情任务。"""
     ok, fail = 0, 0
     idle_since = time.time()
@@ -326,12 +350,14 @@ async def _consume_search_loop(queue, client, storage, pos_queue,
         idle_since = time.time()
         try:
             if task_id.startswith(TASK_KEYWORD + ":"):
-                await _consume_keyword_task(queue, client, storage, pos_queue, task_id)
+                await _consume_keyword_task(queue, client, storage, pos_queue,
+                                            task_id, stats=stats)
                 # 记录最近消费 (进度显示器读)
                 await queue.redis.set("zhaopin:last_consume:search", f"关键词 {task_id}",
                                       ex=60)
             elif task_id.startswith(TASK_COMPANY + ":"):
-                await _consume_company_task(queue, client, storage, pos_queue, task_id)
+                await _consume_company_task(queue, client, storage, pos_queue,
+                                            task_id, stats=stats)
                 await queue.redis.set("zhaopin:last_consume:search",
                                       f"公司补采 {task_id}", ex=60)
             else:
@@ -347,7 +373,7 @@ async def _consume_search_loop(queue, client, storage, pos_queue,
 # ---- 详情任务消费 (position:) ----
 
 async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
-                                 search_q=None) -> Dict:
+                                 search_q=None, stats: LatencyStats = None) -> Dict:
     """详情队列消费协程: position:任务 → detailv2 → upsert PG。
 
     退出条件 (防假早退): 详情队列空**且**搜索池整体静默 (搜索队列空 + 无在途
@@ -369,16 +395,22 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
         number = task_id.split(":", 1)[1] if ":" in task_id else task_id
         try:
             data = await fetch_position_detail_v2_async(client, number)
+            t0 = time.perf_counter()
             row = parse_position_detail_v2(data)
+            if stats is not None:
+                stats.record("detail_parse", time.perf_counter() - t0)
             row["position_number"] = number
             row["source"] = "detailv2"
             row["raw_json"] = _trim_raw_json(data)   # 截断长字段后整体序列化 (保证合法 JSON)
+            t0 = time.perf_counter()
             await storage.upsert_position(row)
             comp = {k: row.get(k, "") for k in
                     ("company_number", "company_name", "company_size",
                      "financing_stage", "industry_name")}
             if comp.get("company_number"):
                 await storage.upsert_company(comp)
+            if stats is not None:
+                stats.record("db_detail", time.perf_counter() - t0)
             await queue.complete(task_id)
             ok += 1
             # 记录最近消费 (进度显示器读, 实时明细)
@@ -406,12 +438,14 @@ async def _watchdog(search_q, pos_q, interval: float = 30.0, max_age: int = 120)
 
 
 async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig, risk=None,
+                            stats: LatencyStats = None,
                             interval: float = 1.0) -> None:
-    """实时进度显示器: 每秒刷新 3 行 (进度/消费/运行), ANSI \\x1b[3A 覆盖。
+    """实时进度显示器: 每秒刷新 4 行 (进度/消费/运行/延迟), ANSI \\x1b[4A 覆盖。
 
     仅 worker0 显示 (多进程 print 会行竞争)。
     行1: 搜索/详情双桶各自速率 (done 每秒增量);
-    行2: 最近消费明细;  行3: 任务运行时间 + 总完成/失败 + 综合速率 + 风控状态。
+    行2: 最近消费明细;  行3: 任务运行时间 + 总完成/失败 + 综合速率 + 风控状态;
+    行4: 分环节延迟 (累计均值, 本 worker 统计代表整体; 见 utils/latency_stats.py)。
     """
     prev_s_done, prev_d_done = 0, 0
     prev_t = time.time()
@@ -448,14 +482,23 @@ async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig, risk=None,
                 line3 = (f"\r[运行] {hh:02d}:{mm:02d}:{ssec:02d}  "
                          f"总完成 {total_done:>7} 总失败 {total_fail:>4}  "
                          f"综合 {total_rate:6.1f}/s  风控:{rk or 'ok'}")
+                # 行4: 分环节延迟 (累计均值, 平滑; 本地解析/DB 显示证明非瓶颈)
+                def _ms(stage: str, nd: int = 0) -> str:
+                    v = stats.current_mean(stage) if stats else None
+                    return f"{v:.{nd}f}" if v is not None else "-"
+                line4 = (f"\r[延迟] 搜索 {_ms('search_net'):>4}ms(TTFB {_ms('search_ttfb'):>3}) | "
+                         f"详情 {_ms('detail_net'):>4}ms(TTFB {_ms('detail_ttfb'):>3}) | "
+                         f"解析 {_ms('detail_parse', 1):>4}ms | 入库 {_ms('db_detail', 1):>4}ms")
                 if printed:
-                    print("\x1b[3A" + line1, end="", flush=True)
+                    print("\x1b[4A" + line1, end="", flush=True)
                     print("\n" + line2, end="", flush=True)
                     print("\n" + line3, end="", flush=True)
+                    print("\n" + line4, end="", flush=True)
                 else:
                     print(line1, end="", flush=True)
                     print("\n" + line2, end="", flush=True)
                     print("\n" + line3, end="", flush=True)
+                    print("\n" + line4, end="", flush=True)
                     printed = True
     except asyncio.CancelledError:
         if cfg.worker_id == 0:
@@ -473,22 +516,30 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
     search_limiter = RedisRateLimiter(search_q.redis, cfg.search_rate, key="zhaopin:ratelimit:search")
     detail_limiter = RedisRateLimiter(search_q.redis, cfg.detail_rate, key="zhaopin:ratelimit:detail")
     risk = RiskState()
-    search_client = AsyncZhilianClient(risk=risk, rate_limiter=search_limiter)
-    detail_client = AsyncZhilianClient(risk=risk, rate_limiter=detail_limiter)
+    stats = LatencyStats()   # 分环节耗时统计 (实时均值 + 结束总结)
+    search_client = AsyncZhilianClient(risk=risk, rate_limiter=search_limiter,
+                                       stats=stats, name="search")
+    detail_client = AsyncZhilianClient(risk=risk, rate_limiter=detail_limiter,
+                                       stats=stats, name="detail")
     storage = await AsyncStorage.create(cfg.db_url)
     # watchdog 独立 Task: 消费 loop 全退后 cancel, 否则 gather 永不返回 (流程不收敛)
     watchdog = asyncio.create_task(_watchdog(search_q, pos_q))
-    monitor = asyncio.create_task(_progress_monitor(search_q, pos_q, cfg, risk=risk))
+    monitor = asyncio.create_task(_progress_monitor(search_q, pos_q, cfg,
+                                                    risk=risk, stats=stats))
     coros = [
-        _consume_search_loop(search_q, search_client, storage, pos_q, cfg)
+        _consume_search_loop(search_q, search_client, storage, pos_q, cfg, stats=stats)
         for _ in range(max(1, cfg.search_concurrency))
     ]
     coros += [
-        _consume_position_loop(pos_q, detail_client, storage, cfg, search_q=search_q)
+        _consume_position_loop(pos_q, detail_client, storage, cfg,
+                               search_q=search_q, stats=stats)
         for _ in range(cfg.concurrency)
     ]
     try:
         results = await asyncio.gather(*coros)
+        # 结束总结 (仅 worker0 打终端, 避免多进程 print 与实时进度 ANSI 覆盖交叠花屏;
+        # 非 worker0 只写各自日志文件, 数据不丢)
+        stats.print_summary(cfg.worker_id, to_stdout=(cfg.worker_id == 0))
     finally:
         watchdog.cancel()
         monitor.cancel()
@@ -521,12 +572,14 @@ def _consume(args) -> None:
     # 启动摘要走 stdout print (不被 WARNING 过滤, 进度显示器下方一次性显示)
     print(f"启动 {workers} 个 worker 进程 (每进程 {args.concurrency} 并发, "
           f"搜索 {args.search_rate:.0f}/s + 详情 {args.detail_rate:.0f}/s)")
+    started = time.time()
     procs = [multiprocessing.Process(target=_worker_main, args=(cfg,)) for cfg in cfg_list]
     for p in procs:
         p.start()
     for p in procs:
         p.join()
-    print("采集完成, 日志见 output/logs/")
+    # 任务总耗时 (各 worker 的分环节统计表已各自打印到终端+日志)
+    print(f"采集完成: 总耗时 {_fmt_elapsed(time.time() - started)}, 日志见 output/logs/")
 
 
 async def _stats(args) -> None:
