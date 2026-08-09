@@ -186,6 +186,13 @@ _FE_API_HEADERS = {
 }
 
 
+class PermanentPositionError(ConnectionError):
+    """岗位已永久失效 (apiCode=211: 已下架/过期/删除)。
+
+    重试无意义 → 消费方捕获后直接标记 failed, 不再入队重试 (见 collect.py)。
+    """
+
+
 def _fe_api_params(number: str) -> dict:
     """fe-api 动态参数 (非签名, 随机即可)。"""
     return {
@@ -208,6 +215,10 @@ async def fetch_position_detail_v2_async(client: AsyncZhilianClient, number: str
     except json.JSONDecodeError as e:
         raise ConnectionError(f"position-detailv2 响应非 JSON: {e}") from e
     if body.get("code") != 200 or body.get("apiCode") != 200:
+        if body.get("apiCode") == 211:
+            # 岗位已失效 (下架/过期/删除): 永久性, 重试无意义, 直接标记
+            raise PermanentPositionError(
+                f"position-detailv2 岗位失效 apiCode=211 {number}")
         raise ConnectionError(
             f"position-detailv2 业务错误 code={body.get('code')} apiCode={body.get('apiCode')} "
             f"msg={body.get('message')}")

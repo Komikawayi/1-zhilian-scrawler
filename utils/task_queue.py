@@ -118,6 +118,48 @@ class TaskQueue:
                 added += 1
         return added
 
+    async def enqueue_many_batch(self, task_ids: Iterable[str]) -> int:
+        """批量入队 (pipeline, 1 次 RTT): 先去重再 RPUSH, 返回新增数。
+
+        网络往返从 O(n) 降到 O(1) (搜索页每页 ~14 公司/岗位, 快一个量级)。
+        不检查 failed (职位号无重试上限语义); 语义与逐条 enqueue 等价。
+        """
+        tids = list(task_ids)
+        if not tids:
+            return 0
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for tid in tids:
+                pipe.sadd(self._seen, tid)
+            results = await pipe.execute()
+        added = [tid for tid, r in zip(tids, results) if r]
+        if added:
+            await self.redis.rpush(self._queue, *added)
+        return len(added)
+
+    async def enqueue_new_not_failed(self, task_ids: Iterable[str]) -> int:
+        """批量入队 (pipeline, 2 次 RTT): 跳过 failed 且未 seen 的任务, 返回新增数。
+
+        语义等价于逐条 `not is_failed(t) and enqueue(t)` (company: 补采任务防失败风暴)。
+        """
+        tids = list(task_ids)
+        if not tids:
+            return 0
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for tid in tids:
+                pipe.sismember(self._failed, tid)
+            res_f = await pipe.execute()
+        fresh = [tid for tid, f in zip(tids, res_f) if not f]
+        if not fresh:
+            return 0
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for tid in fresh:
+                pipe.sadd(self._seen, tid)
+            res_s = await pipe.execute()
+        new_ids = [tid for tid, r in zip(fresh, res_s) if r]
+        if new_ids:
+            await self.redis.rpush(self._queue, *new_ids)
+        return len(new_ids)
+
     # ---- consumer ----
 
     async def dequeue(self, timeout: int = 1) -> Optional[str]:
@@ -153,6 +195,15 @@ class TaskQueue:
         await self.redis.hdel(self._attempts, task_id)           # 清理计数
         logger.warning("任务 %s 失败 %d 次, 标记 failed", task_id, n)
         return False
+
+    async def fail_permanent(self, task_id: str) -> None:
+        """永久失败: 直接标记 failed, 不入队重试 (岗位失效等不可恢复错误)。
+
+        区分可重试/不可重试: 失败风暴时避免无意义重试占队列、刷错误日志。
+        """
+        await self.redis.hdel(self._processing, task_id)
+        await self.redis.sadd(self._failed, task_id)
+        await self.redis.hdel(self._attempts, task_id)
 
     async def recover_stale(self, max_age: int = STALE_MAX_AGE) -> int:
         """回收崩溃 worker 的在途任务 (分布式锁保证单实例执行)。

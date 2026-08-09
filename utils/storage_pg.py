@@ -154,6 +154,32 @@ class AsyncStorage:
                 "company_name=EXCLUDED.company_name, fetched_at=now()",
                 company_number, company_name)
 
+    async def upsert_company_mini_batch(self, rows) -> None:
+        """批量 upsert 公司号+名 (单条多行 SQL, 1 次 RTT + 单事务)。
+
+        语义与 upsert_company_mini 逐条完全一致。
+        用 unnest 数组拼单条 INSERT: 单语句事务内锁行顺序由 PG 决定, 不会像
+        executemany 多语句那样跨语句持锁形成死锁环 (多 worker 并发写重叠公司时
+        曾出现 deadlock detected)。
+        """
+        items = sorted((str(cn), str(name)) for cn, name in rows if cn and name)
+        if not items:
+            return
+        # 同页可能同一公司多个岗位 → 先按公司号去重 (同 key 重复写, 单语句
+        # ON CONFLICT 会报 "cannot affect row a second time"; 语义上只写一次即可)
+        uniq: Dict[str, str] = {}
+        for cn, nm in items:
+            uniq.setdefault(cn, nm)
+        items = sorted(uniq.items())
+        sql = (
+            "INSERT INTO companies (company_number, company_name) "
+            "SELECT c, n FROM unnest($1::text[], $2::text[]) AS t(c, n) "
+            "ON CONFLICT (company_number) DO UPDATE SET "
+            "company_name = EXCLUDED.company_name, fetched_at = now()"
+        )
+        async with self.pool.acquire() as conn:
+            await conn.execute(sql, [cn for cn, _ in items], [nm for _, nm in items])
+
     async def get_company_name(self, company_number: str) -> str:
         """按公司号查公司名 (company: 任务消费用); 不存在返回空串。"""
         async with self.pool.acquire() as conn:

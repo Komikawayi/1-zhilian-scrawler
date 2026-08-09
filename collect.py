@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import settings
 from utils.async_client import (
-    AsyncRateLimiter, AsyncZhilianClient, RedisRateLimiter,
+    AsyncRateLimiter, AsyncZhilianClient, PermanentPositionError, RedisRateLimiter,
     fetch_position_detail_v2_async,
 )
 from utils.latency_stats import LatencyStats
@@ -249,28 +249,23 @@ async def _consume_keyword_task(queue, client, storage, pos_queue, task_id: str,
         pl = state.get("positionList") or []
         total_pages = int(state.get("pages") or 0)
         nums = [it.get("number") for it in pl if isinstance(it, dict) and it.get("number")]
+        comps = [(it.get("companyNumber"), it.get("companyName"))
+                 for it in pl if isinstance(it, dict)]
+        comps = [c for c in comps if c[0] and c[1]]
         if nums:
-            added += await pos_queue.enqueue_many(
+            # 批量: 岗位入详情队列 (按 seen 去重) + 公司号入搜索队列 (去重+跳过 failed)
+            #  + 公司名落库, 各 1 次 RTT (原来每岗位/公司 ~2-3 次, 页级后处理 ~100ms→~10ms)
+            added += await pos_queue.enqueue_many_batch(
                 pos_queue.make_position_task(n) for n in nums)
-        # 公司号+名 → companies 表 (mini), 计 db_search (页级聚合)
+        if comps:
+            await queue.enqueue_new_not_failed(
+                queue.make_company_task(c[0]) for c in comps)
+        # 公司号+名 → companies 表 (mini), 计 db_search (页级聚合, 批量 1 条 SQL)
         t0 = time.perf_counter()
-        for it in pl:
-            if not isinstance(it, dict):
-                continue
-            cn, name = it.get("companyNumber"), it.get("companyName")
-            if cn and name:
-                await storage.upsert_company_mini(cn, name)
+        if comps:
+            await storage.upsert_company_mini_batch(comps)
         if stats is not None:
             stats.record("db_search", time.perf_counter() - t0)
-        # 生成 company: 补采任务 (Redis 队列操作本地快, 不计入统计)
-        for it in pl:
-            if not isinstance(it, dict):
-                continue
-            cn, name = it.get("companyNumber"), it.get("companyName")
-            if cn and name:
-                comp_task = queue.make_company_task(cn)
-                if not await queue.is_failed(comp_task):   # 已重试超限不再拉起 (防失败风暴)
-                    await queue.enqueue(comp_task)
         # 精确终止: SSR 给出总页数, 翻完为止
         if total_pages > 0 and page >= total_pages:
             break
@@ -307,16 +302,14 @@ async def _consume_company_task(queue, client, storage, pos_queue, task_id: str,
             stats.record("search_parse", time.perf_counter() - t0)
         pl = state.get("positionList") or []
         total_pages = int(state.get("pages") or 0)
-        page_matched = 0
-        for it in pl:
-            if not isinstance(it, dict):
-                continue
-            if it.get("companyNumber") != company_number:
-                continue  # 同名公司, 严格过滤
-            num = it.get("number")
-            if num and await pos_queue.enqueue(pos_queue.make_position_task(num)):
-                added += 1
-            page_matched += 1
+        matched = [it.get("number")
+                   for it in pl if isinstance(it, dict)
+                   and it.get("companyNumber") == company_number]
+        if matched:
+            # 批量入队 (去重, 1 次 RTT; 原来逐条 ~2 次/岗位)
+            added += await pos_queue.enqueue_many_batch(
+                pos_queue.make_position_task(n) for n in matched)
+        page_matched = len(matched)
         # 精确终止: SSR 明确给出总页数, 翻完为止
         if total_pages > 0 and page >= total_pages:
             break
@@ -377,8 +370,8 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
     """详情队列消费协程: position:任务 → detailv2 → upsert PG。
 
     退出条件 (防假早退): 详情队列空**且**搜索池整体静默 (搜索队列空 + 无在途
-    搜索任务) 才立即返回; 否则等 IDLE_EXIT_SEC 空闲超时。搜索 worker 还在
-    产出时详情 worker 不提前退出。
+    搜索任务) 才立即返回; 搜索池未耗尽时详情 worker 永不因空闲退出 (新岗位可能
+    零星入队, 空窗期不退避免漏采), 只有搜索池也耗尽后才受 IDLE_EXIT_SEC 约束。
     """
     ok, fail = 0, 0
     idle_since = time.time()
@@ -387,6 +380,11 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
         if task_id is None:
             if await queue.is_drained() and (search_q is None or await search_q.is_drained()):
                 return {"ok": ok, "fail": fail}
+            # 搜索池未耗尽 (队列有任务或搜索在途): 详情 worker 永不因空闲退出,
+            # 新岗位随到随采 (seen 去重下新岗位可能零星入队, 不能因为 10 分钟
+            # 空窗退出而漏采)。只有搜索池也耗尽时才受 IDLE_EXIT_SEC 约束。
+            if search_q is not None and not await search_q.is_drained():
+                continue
             if time.time() - idle_since > IDLE_EXIT_SEC:
                 logger.info("worker%d 详情空闲 %ds 无新任务, 退出", cfg.worker_id, IDLE_EXIT_SEC)
                 return {"ok": ok, "fail": fail}
@@ -418,6 +416,12 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
                 "zhaopin:last_consume:detail",
                 f"{row.get('position_name', '')[:18]}|{row.get('work_city', '')}",
                 ex=60)
+        except PermanentPositionError as e:
+            # 岗位已失效 (211): 永久性, 直接标 failed 不入队重试 (跳过是默认行为,
+            # 静默处理, 仅 info 留档不刷终端)
+            fail += 1
+            logger.info("详情 %s 岗位失效(211), 跳过", number)
+            await queue.fail_permanent(task_id)
         except Exception as e:  # noqa: BLE001
             fail += 1
             # 终端默认只留 WARNING, 偶发 curl 断连重试会刷屏 → 只记 ERROR (final 失败)
