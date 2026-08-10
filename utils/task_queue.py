@@ -196,11 +196,15 @@ return legacy
 """
 
     def __init__(self, redis_url: str = DEFAULT_URL,
-                 queue_type: str = QUEUE_POSITION) -> None:
+                 queue_type: str = QUEUE_POSITION,
+                 max_connections: Optional[int] = None) -> None:
         if queue_type not in QUEUE_TYPES:
             raise ValueError(f"queue_type 必须 ∈ {QUEUE_TYPES}, got {queue_type!r}")
         self.type = queue_type
-        self.redis = aioredis.Redis.from_url(redis_url, decode_responses=True)
+        pool_kwargs = {"decode_responses": True}
+        if max_connections is not None:
+            pool_kwargs["max_connections"] = max(1, int(max_connections))
+        self.redis = aioredis.Redis.from_url(redis_url, **pool_kwargs)
         self._queue = f"{PREFIX}{queue_type}:queue"
         self._processing_list = f"{PREFIX}{queue_type}:processing:list"
         self._processing = f"{PREFIX}{queue_type}:processing"

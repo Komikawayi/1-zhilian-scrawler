@@ -115,6 +115,7 @@ PostgreSQL
 
 - **搜索/详情分桶**：当前目标搜索 100/s、详情 400/s；这是配置目标，不表述为服务端硬上限
 - **连接池显式跟随并发**：不会再被 curl_cffi 默认 `max_clients=10` 静默截断
+- **Redis 连接池显式跟随 worker 并发**：每个 worker 的连接池上限按 `search_concurrency + concurrency + 32` 计算（400/100 配置对应 532），避免 redis-py 默认上限导致 `MaxConnectionsError`
 - **Windows 运行时边界**：curl_cffi 的 asyncio selector 使用 `select()`，本机池 600 以上会先触发文件描述符限制；这是客户端约束，不是服务端上限
 - **共享风控**：异步生产路径使用 Redis 状态机，同一 `ZHAOPIN_EGRESS_ID` 的 worker 共享冷却窗口
 - **211 有限重试**：有效岗位在高并发下可能偶发 211 后恢复 200，不能单次判定永久失效

@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from collect import (
-    RAW_JSON_MAX, WorkerConfig, _consume, _consume_position_loop, _trim_raw_json,
+    RAW_JSON_MAX, WorkerConfig, _consume, _consume_position_loop, _split_csv,
+    _trim_raw_json,
 )
 from utils.async_client import AsyncZhilianClient, PositionUnavailableError
 
@@ -33,6 +34,10 @@ def test_trim_raw_json_short_untouched():
     data = {"a": "short", "b": [1, 2], "c": {"d": "e"}}
     raw = _trim_raw_json(data)
     assert json.loads(raw) == data
+
+
+def test_split_csv_accepts_fullwidth_comma():
+    assert _split_csv("smt，pcba, 贴片") == ["smt", "pcba", "贴片"]
 
 
 def test_async_client_exposes_connection_pool_size():

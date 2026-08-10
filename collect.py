@@ -80,6 +80,11 @@ logger = logging.getLogger("collect")
 IDLE_EXIT_SEC = 600
 
 
+def _split_csv(value: str) -> list[str]:
+    """按中英文逗号拆分 CLI/向导输入，避免全角标点被当作内容。"""
+    return [item.strip() for item in value.replace("，", ",").split(",") if item.strip()]
+
+
 def _fmt_elapsed(seconds: float) -> str:
     """秒 → HH:MM:SS (任务总耗时显示)。"""
     hh, mm, ss = int(seconds // 3600), int(seconds % 3600 // 60), int(seconds % 60)
@@ -165,8 +170,8 @@ async def _produce(args) -> int:
     try:
         # 1) 关键词任务: 城市×关键词 笛卡尔积 (每组合 1 个任务, 消费时自动翻完所有页)
         if args.kw:
-            cities = [c.strip() for c in (args.cities or args.jl or "0").split(",") if c.strip()]
-            keywords = [k.strip() for k in args.kw.split(",") if k.strip()]
+            cities = _split_csv(args.cities or args.jl or "0")
+            keywords = _split_csv(args.kw)
             for city in cities:
                 for kw in keywords:
                     tid = search_q.make_keyword_task(city, kw)
@@ -176,7 +181,7 @@ async def _produce(args) -> int:
                   f"= {total} 个 (每任务自动翻完所有页)")
         # 2) 公司任务
         if args.companies:
-            companies = [c.strip() for c in args.companies.split(",") if c.strip()]
+            companies = _split_csv(args.companies)
             for num in companies:
                 tid = search_q.make_company_task(num)
                 if await search_q.enqueue(tid):
@@ -587,8 +592,12 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
     搜索/详情分桶限速: 搜索用 search 桶 (IP 信誉敏感), 详情用 detail 桶
     (高频, 实测无风控)。两个 client 各持自己的 rate_limiter。
     """
-    search_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_SEARCH)
-    pos_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_POSITION)
+    # BLMOVE/限速/风控均是并发 Redis 操作；默认连接池上限 10 无法覆盖高并发 worker。
+    redis_max_connections = max(64, cfg.concurrency + cfg.search_concurrency + 32)
+    search_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_SEARCH,
+                         max_connections=redis_max_connections)
+    pos_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_POSITION,
+                      max_connections=redis_max_connections)
     limiter_prefix = f"zhaopin:ratelimit:{settings.EGRESS_ID}"
     search_limiter = RedisRateLimiter(
         search_q.redis, cfg.search_rate, key=f"{limiter_prefix}:search")
