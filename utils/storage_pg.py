@@ -20,8 +20,7 @@ import csv
 import json
 import logging
 import os
-import time
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import asyncpg
 
@@ -217,7 +216,9 @@ class AsyncStorage:
     async def export_csv(self, path: str, table: str = "positions") -> int:
         """把表导出为 CSV (UTF-8 BOM)。返回行数。"""
         async with self.pool.acquire() as conn:
-            cols = [c["name"] for c in await conn.fetch(f"SELECT column_name AS name FROM information_schema.columns WHERE table_name=$1", table)]
+            cols = [c["name"] for c in await conn.fetch(
+                "SELECT column_name AS name FROM information_schema.columns WHERE table_name=$1",
+                table)]
             rows = await conn.fetch(f"SELECT * FROM {table}")
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8-sig", newline="") as f:

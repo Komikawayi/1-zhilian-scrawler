@@ -194,7 +194,7 @@ def clean_job_desc(html: str) -> str:
         return html
     # 整理: \xa0(nbsp)→空格, 每行 strip, 过滤空行 (合并连续换行), 去首尾换行
     lines = [ln.replace("\xa0", " ").strip() for ln in raw.split("\n")]
-    return "\n".join(l for l in lines if l)
+    return "\n".join(line for line in lines if line)
 
 
 def _parse_detail(

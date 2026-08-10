@@ -2,6 +2,9 @@
 """智联招聘搜索采集器 — 默认配置。"""
 from __future__ import annotations
 
+import json as _json
+import os as _os
+
 # 常见城市代码 (zhaopin 城市 code)
 CITY_CODES = {
     "北京": "530",
@@ -30,17 +33,13 @@ TIMEOUT = 25             # 请求超时 (秒)
 # ---- 异步流水线 (Phase A: 高并发 + SQLite 入库, 见 collect.py) ----
 # 详情 position-detailv2 无 IP 信誉依赖 (448/448 压测零升级), 可高并发;
 # 搜索 SSR 风控敏感, 保持低频。
-DETAIL_CONCURRENCY = 10          # 每 worker 详情并发协程数 (并发10已达单IP~70/s上限)
-SEARCH_CONCURRENCY = 15          # 每 worker 搜索协程数 (搜索桶 30/s 需 ≥ 全局 30 协程; 默认 15/worker 打满)
-DETAIL_RATE_PER_SEC = 80.0       # 详情桶限速 (请求/秒, 服务器端单IP软限~70/s)
-SEARCH_RATE_PER_SEC = 30.0       # 搜索桶限速 (请求/秒, IP 信誉敏感, 实测 33/s 安全, 30 留余量)
+DETAIL_CONCURRENCY = 10          # 每 worker 详情并发协程数；连接池显式跟随该值
+SEARCH_CONCURRENCY = 15          # 每 worker 搜索并发协程数
+DETAIL_RATE_PER_SEC = 80.0       # 详情桶保守生产值；提升前需持续压测
+SEARCH_RATE_PER_SEC = 20.0       # 搜索桶限速；当前短测约 25/s 后延迟明显升高
 QUEUE_SIZE = 200                 # 队列容量 (背压)
 # ---- PostgreSQL 存储 (百万级, 隔离部署: zhilian-net, 127.0.0.1:5433) ----
 # URL 优先级: 环境变量 ZHAOPIN_DB_URL > config/db.local.json (gitignored) > 默认
-import json as _json
-import os as _os
-
-
 def _load_db_url() -> str:
     env = _os.environ.get("ZHAOPIN_DB_URL")
     if env:
@@ -59,6 +58,7 @@ DB_POOL_MAX = 20                 # 连接池上限 (多 worker 并发写)
 
 # ---- Redis 分布式任务队列 (Phase B: 万级, 隔离部署) ----
 REDIS_URL = "redis://127.0.0.1:6379/0"   # 隔离的 zhilian-redis 容器 (zhilian-net, 仅本机)
+EGRESS_ID = _os.environ.get("ZHAOPIN_EGRESS_ID", "default")
 WORKERS = 2                               # 默认消费 worker 进程数
 MAX_ATTEMPTS = 3                          # 任务失败重试次数 (Redis 队列)
 TASK_POOL_CAP = 20000                     # 单任务池上限 (万级护栏)

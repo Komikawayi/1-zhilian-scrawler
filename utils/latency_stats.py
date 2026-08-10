@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import unicodedata
 from collections import deque
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 

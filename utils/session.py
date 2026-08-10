@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import socket
-from typing import Dict, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

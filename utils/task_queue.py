@@ -1,39 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Redis 分布式任务队列 — 搜索/详情双队列 (多进程分布式, 崩溃安全)
+Redis 分布式任务队列, 搜索/详情双队列。
 
-任务类型 (队列隔离, 各持独立键):
-  search 队列    zhaopin:tasks:search:*     (搜索任务, 与详情共享全局限速)
-    keyword:{city}:{kw}:{page}   关键词搜索任务 (阶段一, producer 生成)
-    company:{company_number}     公司名搜索任务 (阶段二, 查缺补漏)
-  position 队列  zhaopin:tasks:position:*   (岗位详情任务)
-    position:{number}            岗位详情任务 (搜索消费后投递)
-
-为什么分队列: 搜索任务消费后**产出新任务** (岗位号/公司号), 详情任务消费后
-**入库** — 消费逻辑不同, 独立 worker 池可独立调并发; 但限速共享同一令牌桶
-(同一 IP 信誉资源, RedisRateLimiter 全局 key 天然共享)。
-
-Redis 键 (每个队列类型 type ∈ {search, position}):
-  zhaopin:tasks:{type}:queue       (LIST, 待办)
-  zhaopin:tasks:{type}:processing  (HASH: task_id→claimed_at, 崩溃回收)
-  zhaopin:tasks:{type}:seen        (SET, 跨 producer 去重)
-  zhaopin:tasks:{type}:done        (SET)
-  zhaopin:tasks:{type}:failed      (SET, 重试超限)
-  zhaopin:tasks:{type}:attempts    (HASH: task_id→count, 带 TTL 防泄漏)
-
-崩溃安全 (redis-patterns):
-  - processing 存 claimed_at 时间戳; recover_stale() 用分布式锁
-    (SET NX PX) 回收超时未完成的任务重新入队 → worker 崩溃不丢任务、不卡死
-  - attempts 用 HASH 而非散 key, complete/failed 清理 + EXPIRE 兜底 → 无内存泄漏
-
-Worker 多进程安全: Redis 原子操作 (SADD/RPUSH/BLPOP/HSET), 天然多消费者。
-数据本体仍入 PostgreSQL (positions/companies), Redis 只做任务调度 + 全局协调。
+任务状态使用 Redis Lua 脚本保持原子性。领取时先用 BLMOVE 把任务移到
+processing staging list，再写租约时间和 claim token；即使 worker 在写租约前退出，
+watchdog 仍能发现 staging list 中的任务并回收，旧 token 也不能操作新租约。
 """
 from __future__ import annotations
 
 import logging
-import time
-from typing import Iterable, Optional
+import uuid
+from collections.abc import Iterable
+from typing import Optional
 
 import redis.asyncio as aioredis
 
@@ -43,30 +21,179 @@ PREFIX = "zhaopin:tasks:"
 LOCK_PREFIX = "zhaopin:lock:"
 DEFAULT_URL = "redis://127.0.0.1:6379/0"
 
-# 队列类型
 QUEUE_SEARCH = "search"
 QUEUE_POSITION = "position"
 QUEUE_TYPES = (QUEUE_SEARCH, QUEUE_POSITION)
 
-# 任务 id 前缀 (任务类型, 跨队列不撞)
-TASK_KEYWORD = "keyword"     # keyword:{city}:{kw}:{page}
-TASK_COMPANY = "company"     # company:{company_number}
-TASK_POSITION = "position"   # position:{number}
+TASK_KEYWORD = "keyword"
+TASK_COMPANY = "company"
+TASK_POSITION = "position"
 
-# 默认: 在途任务超过该秒数视为 worker 崩溃, 回收重新入队
 STALE_MAX_AGE = 120
-# attempts hash 兜底 TTL (正常 complete/failed 会清理, 防异常累积)
+LOCK_TTL = 30
 ATTEMPTS_TTL = 86400
 
 
-class TaskQueue:
-    """Redis 异步任务队列 (单类型, 崩溃安全)。
+class TaskClaim(str):
+    """行为与 task_id 字符串一致，同时携带本次领取的 fencing token。"""
 
-    用法:
-        q = TaskQueue(url, queue_type="position")
-        await q.enqueue("position:CCLxxx")
-        await q.dequeue()
-    """
+    token: str
+
+    def __new__(cls, task_id: str, token: str):
+        claim = super().__new__(cls, task_id)
+        claim.token = token
+        return claim
+
+
+class TaskQueue:
+    """Redis 异步任务队列 (单类型, 崩溃安全)。"""
+
+    _ENQUEUE_LUA = """
+local added = 0
+for i = 1, #ARGV do
+  if redis.call('SADD', KEYS[1], ARGV[i]) == 1 then
+    redis.call('RPUSH', KEYS[2], ARGV[i])
+    added = added + 1
+  end
+end
+return added
+"""
+
+    _ENQUEUE_NOT_FAILED_LUA = """
+local added = 0
+for i = 1, #ARGV do
+  local tid = ARGV[i]
+  if redis.call('SISMEMBER', KEYS[1], tid) == 0 and
+     redis.call('SADD', KEYS[2], tid) == 1 then
+    redis.call('RPUSH', KEYS[3], tid)
+    added = added + 1
+  end
+end
+return added
+"""
+
+    _CLAIM_LUA = """
+if not redis.call('LPOS', KEYS[1], ARGV[1]) then
+  return 0
+end
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
+redis.call('HSET', KEYS[2], ARGV[1], now)
+redis.call('HSET', KEYS[3], ARGV[1], ARGV[2])
+return 1
+"""
+
+    _COMPLETE_LUA = """
+local token = redis.call('HGET', KEYS[3], ARGV[1])
+if not token or token ~= ARGV[2] then
+  return 0
+end
+local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+redis.call('HDEL', KEYS[2], ARGV[1])
+redis.call('HDEL', KEYS[3], ARGV[1])
+if removed > 0 then
+  redis.call('INCR', KEYS[4])
+end
+return removed
+"""
+
+    _FAIL_LUA = """
+local tid = ARGV[1]
+local token = redis.call('HGET', KEYS[3], tid)
+if not token or token ~= ARGV[2] then
+  return -1
+end
+local max_attempts = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+redis.call('LREM', KEYS[1], 1, tid)
+redis.call('HDEL', KEYS[2], tid)
+redis.call('HDEL', KEYS[3], tid)
+local n = redis.call('HINCRBY', KEYS[5], tid, 1)
+redis.call('EXPIRE', KEYS[5], ttl)
+if n < max_attempts then
+  redis.call('RPUSH', KEYS[4], tid)
+  return n
+end
+redis.call('SADD', KEYS[6], tid)
+redis.call('HDEL', KEYS[5], tid)
+return 0
+"""
+
+    _FAIL_PERMANENT_LUA = """
+local token = redis.call('HGET', KEYS[3], ARGV[2])
+if not token or token ~= ARGV[1] then
+  return 0
+end
+local tid = ARGV[2]
+local removed = redis.call('LREM', KEYS[1], 1, tid)
+redis.call('HDEL', KEYS[2], tid)
+redis.call('HDEL', KEYS[3], tid)
+redis.call('SADD', KEYS[4], tid)
+redis.call('HDEL', KEYS[5], tid)
+return removed
+"""
+
+    _RECOVER_LUA = """
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
+local max_age = tonumber(ARGV[1])
+local recovered = 0
+local items = redis.call('LRANGE', KEYS[1], 0, -1)
+for _, tid in ipairs(items) do
+  local ts = redis.call('HGET', KEYS[2], tid)
+  if not ts or now - tonumber(ts) > max_age then
+    if redis.call('LREM', KEYS[1], 1, tid) > 0 then
+      redis.call('HDEL', KEYS[2], tid)
+      redis.call('HDEL', KEYS[4], tid)
+      redis.call('RPUSH', KEYS[3], tid)
+      recovered = recovered + 1
+    end
+  end
+end
+return recovered
+"""
+
+    _UNLOCK_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+    _HEARTBEAT_LUA = """
+if redis.call('LPOS', KEYS[1], ARGV[1]) and
+   redis.call('HGET', KEYS[3], ARGV[1]) == ARGV[2] then
+  local clock = redis.call('TIME')
+  local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
+  redis.call('HSET', KEYS[2], ARGV[1], now)
+  return 1
+end
+return 0
+"""
+
+    _MIGRATE_PROCESSING_LUA = """
+local migrated = 0
+local tids = redis.call('HKEYS', KEYS[1])
+for _, tid in ipairs(tids) do
+  if not redis.call('LPOS', KEYS[2], tid) then
+    redis.call('RPUSH', KEYS[2], tid)
+    migrated = migrated + 1
+  end
+  redis.call('HSETNX', KEYS[3], tid, 'legacy:' .. tid)
+end
+return migrated
+"""
+
+    _SEED_DONE_LUA = """
+local current = redis.call('GET', KEYS[1])
+if current then
+  return current
+end
+local legacy = redis.call('SCARD', KEYS[2])
+redis.call('SET', KEYS[1], legacy)
+redis.call('DEL', KEYS[2])
+return legacy
+"""
 
     def __init__(self, redis_url: str = DEFAULT_URL,
                  queue_type: str = QUEUE_POSITION) -> None:
@@ -75,17 +202,18 @@ class TaskQueue:
         self.type = queue_type
         self.redis = aioredis.Redis.from_url(redis_url, decode_responses=True)
         self._queue = f"{PREFIX}{queue_type}:queue"
+        self._processing_list = f"{PREFIX}{queue_type}:processing:list"
         self._processing = f"{PREFIX}{queue_type}:processing"
+        self._claim_tokens = f"{PREFIX}{queue_type}:claim_tokens"
         self._seen = f"{PREFIX}{queue_type}:seen"
-        self._done = f"{PREFIX}{queue_type}:done"
+        self._done = f"{PREFIX}{queue_type}:done"  # legacy set, migrated lazily
+        self._done_count = f"{PREFIX}{queue_type}:done_count"
         self._failed = f"{PREFIX}{queue_type}:failed"
         self._attempts = f"{PREFIX}{queue_type}:attempts"
-
-    # ---- 任务 id 构造 (对外入口) ----
+        self._claims: dict[str, str] = {}
 
     @staticmethod
     def make_keyword_task(city: str, kw: str) -> str:
-        """关键词搜索任务 (每"城市×关键词"组合一个任务, 消费时自动翻完所有页)。"""
         return f"{TASK_KEYWORD}:{city}:{kw}"
 
     @staticmethod
@@ -98,156 +226,154 @@ class TaskQueue:
 
     @staticmethod
     def task_type(task_id: str) -> str:
-        """从任务 id 提取类型前缀 (keyword/company/position)。"""
         return task_id.split(":", 1)[0]
 
-    # ---- producer ----
-
     async def enqueue(self, task_id: str) -> bool:
-        """入队; 返回是否新任务 (去重)。"""
-        if await self.redis.sadd(self._seen, task_id):
-            await self.redis.rpush(self._queue, task_id)
-            return True
-        return False
+        added = await self.redis.eval(self._ENQUEUE_LUA, 2,
+                                      self._seen, self._queue, task_id)
+        return bool(added)
 
     async def enqueue_many(self, task_ids: Iterable[str]) -> int:
-        """批量入队 (去重), 返回新增数。接受 list/tuple/生成器。"""
-        added = 0
-        for tid in task_ids:
-            if await self.enqueue(tid):
-                added += 1
-        return added
+        return await self.enqueue_many_batch(task_ids)
 
     async def enqueue_many_batch(self, task_ids: Iterable[str]) -> int:
-        """批量入队 (pipeline, 1 次 RTT): 先去重再 RPUSH, 返回新增数。
-
-        网络往返从 O(n) 降到 O(1) (搜索页每页 ~14 公司/岗位, 快一个量级)。
-        不检查 failed (职位号无重试上限语义); 语义与逐条 enqueue 等价。
-        """
         tids = list(task_ids)
         if not tids:
             return 0
-        async with self.redis.pipeline(transaction=False) as pipe:
-            for tid in tids:
-                pipe.sadd(self._seen, tid)
-            results = await pipe.execute()
-        added = [tid for tid, r in zip(tids, results) if r]
-        if added:
-            await self.redis.rpush(self._queue, *added)
-        return len(added)
+        return int(await self.redis.eval(self._ENQUEUE_LUA, 2,
+                                         self._seen, self._queue, *tids))
 
     async def enqueue_new_not_failed(self, task_ids: Iterable[str]) -> int:
-        """批量入队 (pipeline, 2 次 RTT): 跳过 failed 且未 seen 的任务, 返回新增数。
-
-        语义等价于逐条 `not is_failed(t) and enqueue(t)` (company: 补采任务防失败风暴)。
-        """
         tids = list(task_ids)
         if not tids:
             return 0
-        async with self.redis.pipeline(transaction=False) as pipe:
-            for tid in tids:
-                pipe.sismember(self._failed, tid)
-            res_f = await pipe.execute()
-        fresh = [tid for tid, f in zip(tids, res_f) if not f]
-        if not fresh:
-            return 0
-        async with self.redis.pipeline(transaction=False) as pipe:
-            for tid in fresh:
-                pipe.sadd(self._seen, tid)
-            res_s = await pipe.execute()
-        new_ids = [tid for tid, r in zip(fresh, res_s) if r]
-        if new_ids:
-            await self.redis.rpush(self._queue, *new_ids)
-        return len(new_ids)
+        return int(await self.redis.eval(self._ENQUEUE_NOT_FAILED_LUA, 3,
+                                         self._failed, self._seen,
+                                         self._queue, *tids))
 
-    # ---- consumer ----
+    async def dequeue(self, timeout: int = 1) -> Optional[TaskClaim]:
+        """原子移入 staging list，再写领取时间。"""
+        while True:
+            task_id = await self.redis.blmove(self._queue, self._processing_list,
+                                              timeout=timeout, src="LEFT",
+                                              dest="RIGHT")
+            if task_id is None:
+                return None
+            token = uuid.uuid4().hex
+            claimed = await self.redis.eval(
+                self._CLAIM_LUA, 3, self._processing_list, self._processing,
+                self._claim_tokens, task_id, token)
+            if claimed:
+                self._claims[task_id] = token
+                return TaskClaim(task_id, token)
+            # A concurrent stale-recovery may have moved this staging item back.
+            # Retry the dequeue so the task is not lost.
 
-    async def dequeue(self, timeout: int = 1) -> Optional[str]:
-        """阻塞取一个任务 (BLPOP), 标记 processing (记录领取时间)。"""
-        item = await self.redis.blpop(self._queue, timeout=timeout)
-        if not item:
-            return None
-        task_id = item[1]
-        await self.redis.hset(self._processing, task_id, str(time.time()))
-        return task_id
+    def claim_token(self, task_id: str) -> Optional[str]:
+        """返回本实例最近领取的租约 token, 供跨层传递或诊断使用。"""
+        return getattr(task_id, "token", None) or self._claims.get(task_id)
 
-    async def complete(self, task_id: str) -> None:
-        await self.redis.hdel(self._processing, task_id)
-        await self.redis.sadd(self._done, task_id)
+    def _resolve_token(self, task_id: str, token: Optional[str]) -> Optional[str]:
+        return token or getattr(task_id, "token", None) or self._claims.get(task_id)
+
+    def _forget_claim(self, task_id: str, token: str) -> None:
+        if self._claims.get(task_id) == token:
+            self._claims.pop(task_id, None)
+
+    async def complete(self, task_id: str, token: Optional[str] = None) -> bool:
+        token = self._resolve_token(task_id, token)
+        if not token:
+            return False
+        removed = await self.redis.eval(self._COMPLETE_LUA, 4,
+                              self._processing_list, self._processing,
+                              self._claim_tokens, self._done_count,
+                              task_id, token)
+        self._forget_claim(task_id, token)
+        return bool(removed)
+
+    async def heartbeat(self, task_id: str, token: Optional[str] = None) -> bool:
+        """续租在途任务；任务已被回收时不重新创建 processing 记录。"""
+        token = self._resolve_token(task_id, token)
+        if not token:
+            return False
+        updated = await self.redis.eval(self._HEARTBEAT_LUA, 3,
+                                        self._processing_list,
+                                        self._processing, self._claim_tokens,
+                                        task_id, token)
+        return bool(updated)
+
+    async def _migrate_legacy_processing(self) -> int:
+        """把旧版本仅存在于 timestamp hash 的在途任务补入 staging list。"""
+        return int(await self.redis.eval(self._MIGRATE_PROCESSING_LUA, 3,
+                                         self._processing,
+                                         self._processing_list,
+                                         self._claim_tokens))
 
     async def is_failed(self, task_id: str) -> bool:
-        """任务是否已重试超限标记 failed (防止 keyword 消费反复拉起失败公司)。"""
         return bool(await self.redis.sismember(self._failed, task_id))
 
-    async def fail(self, task_id: str, max_attempts: int = 3) -> bool:
-        """失败: 尝试次数内重新入队, 否则标记 failed。返回是否重试。
-
-        max_attempts = 总尝试上限 (第 1 次失败 = 尝试 1); 达到上限即标记 failed。
-        """
-        await self.redis.hdel(self._processing, task_id)
-        n = await self.redis.hincrby(self._attempts, task_id, 1)
-        await self.redis.expire(self._attempts, ATTEMPTS_TTL)   # TTL 兜底防泄漏
-        if n < max_attempts:
-            await self.redis.rpush(self._queue, task_id)
-            logger.warning("任务 %s 第 %d 次失败, 重新入队", task_id, n)
+    async def fail(self, task_id: str, max_attempts: int = 3) -> Optional[bool]:
+        token = self._resolve_token(task_id, None) or ""
+        attempt = await self.redis.eval(self._FAIL_LUA, 6,
+                                        self._processing_list, self._processing,
+                                        self._claim_tokens, self._queue,
+                                        self._attempts, self._failed,
+                                        task_id, token, max_attempts, ATTEMPTS_TTL)
+        self._forget_claim(task_id, token)
+        if attempt == -1:
+            return None
+        if attempt:
+            logger.warning("任务 %s 第 %s 次失败, 重新入队", task_id, attempt)
             return True
-        await self.redis.sadd(self._failed, task_id)
-        await self.redis.hdel(self._attempts, task_id)           # 清理计数
-        logger.warning("任务 %s 失败 %d 次, 标记 failed", task_id, n)
+        logger.warning("任务 %s 失败, 标记 failed", task_id)
         return False
 
-    async def fail_permanent(self, task_id: str) -> None:
-        """永久失败: 直接标记 failed, 不入队重试 (岗位失效等不可恢复错误)。
-
-        区分可重试/不可重试: 失败风暴时避免无意义重试占队列、刷错误日志。
-        """
-        await self.redis.hdel(self._processing, task_id)
-        await self.redis.sadd(self._failed, task_id)
-        await self.redis.hdel(self._attempts, task_id)
+    async def fail_permanent(self, task_id: str, token: Optional[str] = None) -> bool:
+        token = self._resolve_token(task_id, token)
+        if not token:
+            return False
+        removed = await self.redis.eval(self._FAIL_PERMANENT_LUA, 5,
+                              self._processing_list, self._processing,
+                              self._claim_tokens, self._failed, self._attempts,
+                              token, task_id)
+        self._forget_claim(task_id, token)
+        return bool(removed)
 
     async def recover_stale(self, max_age: int = STALE_MAX_AGE) -> int:
-        """回收崩溃 worker 的在途任务 (分布式锁保证单实例执行)。
-
-        扫描 processing, 领取时间超过 max_age 的任务重新入队。
-        """
         lock = f"{LOCK_PREFIX}recover:{self.type}"
-        if not await self.redis.set(lock, "1", nx=True, ex=30):
+        token = uuid.uuid4().hex
+        if not await self.redis.set(lock, token, nx=True, ex=LOCK_TTL):
             return 0
         try:
-            now = time.time()
-            rec = await self.redis.hgetall(self._processing)
-            stale = [tid for tid, ts in rec.items()
-                     if now - float(ts) > max_age]
-            for tid in stale:
-                await self.redis.hdel(self._processing, tid)
-                await self.redis.rpush(self._queue, tid)
-            if stale:
-                logger.warning("回收 %d 个崩溃在途任务, 重新入队", len(stale))
-            return len(stale)
+            await self._migrate_legacy_processing()
+            recovered = int(await self.redis.eval(
+                self._RECOVER_LUA, 4, self._processing_list,
+                self._processing, self._queue, self._claim_tokens,
+                max_age))
+            if recovered:
+                logger.warning("回收 %d 个崩溃在途任务, 重新入队", recovered)
+            return recovered
         finally:
-            await self.redis.delete(lock)
+            await self.redis.eval(self._UNLOCK_LUA, 1, lock, token)
 
     async def is_drained(self) -> bool:
-        """队列空且无处理中任务 (worker 退出判定)。"""
+        await self._migrate_legacy_processing()
         return (await self.redis.llen(self._queue)) == 0 and \
-               (await self.redis.hlen(self._processing)) == 0
-
-    # ---- stats / 运维 ----
+               (await self.redis.llen(self._processing_list)) == 0
 
     async def stats(self) -> dict:
+        await self._migrate_legacy_processing()
+        done = await self.redis.eval(self._SEED_DONE_LUA, 2,
+                                     self._done_count, self._done)
         return {
             "queue": await self.redis.llen(self._queue),
-            "processing": await self.redis.hlen(self._processing),
+            "processing": await self.redis.llen(self._processing_list),
             "seen": await self.redis.scard(self._seen),
-            "done": await self.redis.scard(self._done),
+            "done": int(done),
             "failed": await self.redis.scard(self._failed),
         }
 
     async def clear(self) -> None:
-        """清空本队列类型的所有任务键 (重建任务池用)。
-
-        用 SCAN 游标而非 KEYS (KEYS 在生产阻塞 Redis 所有客户端)。
-        """
         n = 0
         async for key in self.redis.scan_iter(f"{PREFIX}{self.type}:*"):
             await self.redis.delete(key)

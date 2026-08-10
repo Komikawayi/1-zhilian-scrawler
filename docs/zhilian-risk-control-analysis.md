@@ -158,6 +158,8 @@ boxId = 'B' + SMID (89字符)
 
 把 §9 的加固建议固化为代码：跨 run 持久化的 IP 信誉状态机（`config/zhilian-risk.local.json`，gitignored）。
 
+> 2026-08-10：分布式 `collect.py` 已改用 Redis 状态 `zhaopin:risk:{ZHAOPIN_EGRESS_ID}`，同一出口的多 worker 共享冷却；本节文件状态机描述仅对应 legacy/sync 路径。
+
 - 防线分级 `ok(直通) → challenge(JS挑战) → captcha(验证码) → cooling`
 - 自适应速率：challenge ×2 / 冷却 ×4（配合 http_client 限速）
 - 指数冷却 60s→120s→240s…（上限 30min），跨 run 记忆，下次启动自动等完

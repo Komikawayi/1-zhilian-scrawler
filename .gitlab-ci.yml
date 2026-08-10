@@ -9,5 +9,6 @@ test:
   script:
     - py -3.11 -m venv .venv
     - .\.venv\Scripts\python.exe -m pip install --upgrade pip
-    - .\.venv\Scripts\python.exe -m pip install -r requirements.txt pytest
+    - .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+    - .\.venv\Scripts\python.exe -m ruff check . --exclude .venv --exclude js_reverse_cache
     - .\.venv\Scripts\python.exe -m pytest tests/ -v

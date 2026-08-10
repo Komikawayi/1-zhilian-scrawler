@@ -18,13 +18,15 @@ def pg_available():
     """PG 不可用时跳过全部存储测试 (CI/无容器环境不崩)。"""
     async def _ping():
         try:
-            conn = await asyncpg.connect(_base_url())
+            # 先检查基础库；zhilian_test 由下面的 _ensure_test_db 创建。
+            conn = await asyncpg.connect(settings.DB_URL)
         except Exception:
             pytest.skip("PostgreSQL 不可用 (需启动隔离的 zhilian-postgres 容器)",
                         allow_module_level=True)
         else:
             await conn.close()
     asyncio.run(_ping())
+    _ensure_test_db()
 
 
 def _run(coro):

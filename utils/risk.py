@@ -8,7 +8,7 @@
 防线分级 (与 docs/zhilian-edgeone-reverse-analysis.md §4 一致):
     ok(直通) → challenge(JS挑战, 可本地解) → captcha(交互验证码, 需冷却) → cooling
 
-持久化: config/zhilian-risk.local.json (gitignored, 不提交)
+持久化: legacy 路径使用本地 JSON；分布式路径使用 Redis 按出口共享状态。
 """
 from __future__ import annotations
 
@@ -19,8 +19,6 @@ import os
 import threading
 import time
 from typing import Dict, Optional
-
-from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -202,3 +200,93 @@ class RiskState:
 
     async def async_on_captcha(self) -> None:
         self.on_captcha()
+
+
+class AsyncRedisRiskState:
+    """跨 worker 共享的异步风控状态。
+
+    状态转移在 Redis Lua 中完成，多个进程看到同一出口 IP 的冷却窗口。
+    ``scope`` 应对应实际出口 IP 或代理身份，多出口时不能共用一个 scope。
+    """
+
+    _CHALLENGE_LUA = """
+local streak = tonumber(redis.call('HGET', KEYS[1], 'challenge_streak') or '0') + 1
+if streak >= tonumber(ARGV[1]) then
+  local count = tonumber(redis.call('HGET', KEYS[1], 'captcha_count') or '0') + 1
+  local cooldown = math.min(tonumber(ARGV[2]) * (2 ^ (count - 1)), tonumber(ARGV[3]))
+  local clock = redis.call('TIME')
+  local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
+  local until_ts = now + cooldown
+  redis.call('HSET', KEYS[1], 'state', 'cooling', 'challenge_streak', streak,
+            'captcha_count', count, 'cooldown_sec', cooldown, 'cooling_until', until_ts)
+  return 'cooling'
+end
+redis.call('HSET', KEYS[1], 'state', 'challenge', 'challenge_streak', streak)
+return 'challenge'
+"""
+
+    _CAPTCHA_LUA = """
+local count = tonumber(redis.call('HGET', KEYS[1], 'captcha_count') or '0') + 1
+local cooldown = math.min(tonumber(ARGV[1]) * (2 ^ (count - 1)), tonumber(ARGV[2]))
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
+local until_ts = now + cooldown
+redis.call('HSET', KEYS[1], 'state', 'cooling', 'captcha_count', count,
+          'cooldown_sec', cooldown, 'cooling_until', until_ts)
+return 'cooling'
+"""
+
+    _SUCCESS_LUA = """
+local state = redis.call('HGET', KEYS[1], 'state')
+local cooling_until = tonumber(redis.call('HGET', KEYS[1], 'cooling_until') or '0')
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
+if state == 'cooling' and cooling_until > now then
+  return 'cooling'
+end
+redis.call('HSET', KEYS[1], 'state', 'ok', 'challenge_streak', 0)
+return 'ok'
+"""
+
+    def __init__(self, redis, scope: str = "default") -> None:
+        self.redis = redis
+        self.key = f"zhaopin:risk:{scope}"
+        self.state = STATE_OK
+
+    async def _ensure(self) -> None:
+        await self.redis.hsetnx(self.key, "state", STATE_OK)
+        await self.redis.hsetnx(self.key, "challenge_streak", 0)
+        await self.redis.hsetnx(self.key, "captcha_count", 0)
+        await self.redis.hsetnx(self.key, "cooling_until", 0)
+        await self.redis.hsetnx(self.key, "cooldown_sec", 0)
+
+    async def _refresh(self) -> dict:
+        await self._ensure()
+        values = await self.redis.hgetall(self.key)
+        self.state = values.get("state", STATE_OK)
+        return values
+
+    async def async_await_cooldown(self) -> None:
+        while True:
+            values = await self._refresh()
+            until = float(values.get("cooling_until", 0) or 0)
+            clock = await self.redis.time()
+            server_now = float(clock[0]) + float(clock[1]) / 1000000
+            sec = until - server_now
+            if values.get("state") != STATE_COOLING or sec <= 0:
+                return
+            logger.info("共享风控冷却中, 等待 %d 秒", int(sec))
+            await asyncio.sleep(min(sec, 5.0))
+
+    async def async_on_success(self) -> None:
+        self.state = await self.redis.eval(self._SUCCESS_LUA, 1, self.key)
+
+    async def async_on_challenge(self) -> None:
+        self.state = await self.redis.eval(
+            self._CHALLENGE_LUA, 1, self.key, CHALLENGE_ESCALATION,
+            COOLDOWN_BASE, COOLDOWN_CAP)
+
+    async def async_on_captcha(self) -> None:
+        self.state = await self.redis.eval(
+            self._CAPTCHA_LUA, 1, self.key, COOLDOWN_BASE,
+            COOLDOWN_CAP)

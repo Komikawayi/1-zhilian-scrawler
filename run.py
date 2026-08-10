@@ -12,11 +12,12 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 import subprocess
 import sys
 from pathlib import Path
+
+from config import settings
 
 # Windows 控制台编码修正: 强制 UTF-8 (中文城市名/关键词在 GBK 终端不乱码)
 if sys.platform == "win32":
@@ -27,9 +28,6 @@ if sys.platform == "win32":
         pass
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
-
-from config import settings
 
 # 配置持久化 (gitignored via config/*.local.json; 记录本机 hostname 区分多机)
 RUN_CONF = ROOT / "config" / "run.local.json"
@@ -40,7 +38,9 @@ CITIES_CONF = ROOT / "config" / "cities.json"
 DEFAULT_PAGES = 5
 DEFAULT_WORKERS = settings.WORKERS
 DEFAULT_CONCURRENCY = settings.DETAIL_CONCURRENCY
+DEFAULT_SEARCH_CONCURRENCY = settings.SEARCH_CONCURRENCY
 DEFAULT_RATE = settings.DETAIL_RATE_PER_SEC
+DEFAULT_SEARCH_RATE = settings.SEARCH_RATE_PER_SEC
 
 
 def _load_json(path: Path, default):
@@ -113,14 +113,15 @@ def _run_redis(conf: dict) -> int:
     print(f"\n>>> produce: {' '.join(cmd)}")
     r = subprocess.run(cmd)
     if r.returncode != 0:
-        print("❌ produce 失败, 中止"); return r.returncode
+        print("❌ produce 失败, 中止")
+        return r.returncode
     # consume (分桶限速: 搜索/详情独立)
     cmd = [sys.executable, str(ROOT / "collect.py"), "--consume",
            "--workers", str(conf["workers"]),
            "--concurrency", str(conf["concurrency"]),
-           "--search-concurrency", str(conf.get("search_concurrency", settings.SEARCH_CONCURRENCY)),
-           "--search-rate", str(conf.get("search_rate", 30)),
-           "--detail-rate", str(conf.get("detail_rate", 80)),
+           "--search-concurrency", str(conf["search_concurrency"]),
+           "--search-rate", str(conf["search_rate"]),
+           "--detail-rate", str(conf["detail_rate"]),
            "--name", conf.get("name", "")]
     print(f">>> consume: {' '.join(cmd)}")
     return subprocess.run(cmd).returncode
@@ -130,7 +131,7 @@ def _run_single(conf: dict) -> int:
     """单机流水线 (调试用)。"""
     kw = ",".join(conf["keywords"])
     cities = ",".join(conf["cities"])
-    cmd = [sys.executable, str(ROOT / "collect.py"),
+    cmd = [sys.executable, str(ROOT / "collect.py"), "--single",
            "--kw", kw, "--cities", cities,
            "--pages", str(conf["pages"]),
            "--concurrency", str(conf["concurrency"]),
@@ -153,7 +154,10 @@ def _default_conf() -> dict:
             "mode": prev.get("mode", "redis"),
             "workers": prev.get("workers", DEFAULT_WORKERS),
             "concurrency": prev.get("concurrency", DEFAULT_CONCURRENCY),
+            "search_concurrency": prev.get("search_concurrency", DEFAULT_SEARCH_CONCURRENCY),
             "rate": prev.get("rate", DEFAULT_RATE),
+            "detail_rate": prev.get("detail_rate", DEFAULT_RATE),
+            "search_rate": prev.get("search_rate", DEFAULT_SEARCH_RATE),
             "clear": prev.get("clear", False),
             "name": prev.get("name", ""),
         }
@@ -167,7 +171,10 @@ def _default_conf() -> dict:
         "mode": "redis",
         "workers": DEFAULT_WORKERS,
         "concurrency": DEFAULT_CONCURRENCY,
+        "search_concurrency": DEFAULT_SEARCH_CONCURRENCY,
         "rate": DEFAULT_RATE,
+        "detail_rate": DEFAULT_RATE,
+        "search_rate": DEFAULT_SEARCH_RATE,
         "clear": False,
         "name": "",
     }
@@ -201,8 +208,11 @@ def _manual_wizard(prev: dict) -> dict:
     pages = int(_prompt("每关键词页数", str(DEFAULT_PAGES)))
     mode = _prompt("模式", "1", "1=Redis分布式 2=单机流水线").strip()
     workers = int(_prompt("worker 进程数", str(DEFAULT_WORKERS)))
-    concurrency = int(_prompt("每进程并发", str(DEFAULT_CONCURRENCY)))
-    rate = float(_prompt("全局限速 req/s", str(DEFAULT_RATE)))
+    concurrency = int(_prompt("详情并发/进程", str(DEFAULT_CONCURRENCY)))
+    search_concurrency = int(_prompt("搜索并发/进程", str(DEFAULT_SEARCH_CONCURRENCY)))
+    rate = float(_prompt("单机模式全局限速 req/s", str(DEFAULT_RATE)))
+    detail_rate = float(_prompt("Redis 详情桶 req/s", str(DEFAULT_RATE)))
+    search_rate = float(_prompt("Redis 搜索桶 req/s", str(DEFAULT_SEARCH_RATE)))
     clear_in = _prompt("produce 前清空队列", "n", "y/n").lower()
     name = _prompt("运行命名", "", "可选, 标记 runs 表")
 
@@ -214,7 +224,10 @@ def _manual_wizard(prev: dict) -> dict:
         "mode": "single" if mode == "2" else "redis",
         "workers": workers,
         "concurrency": concurrency,
+        "search_concurrency": search_concurrency,
         "rate": rate,
+        "detail_rate": detail_rate,
+        "search_rate": search_rate,
         "clear": clear_in in ("y", "yes"),
         "name": name,
     }

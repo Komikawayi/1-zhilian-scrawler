@@ -61,7 +61,7 @@ FROM positions GROUP BY company_number ORDER BY job_cnt DESC;
 
 ## 4. Redis 任务队列设计（双队列 + 类型前缀）
 
-Redis 只承担三件事：**调度**（搜索/详情任务都进 Redis，多进程分布式消费）+ **全局限速**（搜索+详情共享同一令牌桶）+ **防崩溃**（现有机制照搬）。
+Redis 承担三件事：**调度**（搜索/详情双队列）+ **按出口身份限速**（搜索/详情独立桶）+ **共享风控/崩溃恢复**。
 
 ```
 搜索队列  zhaopin:tasks:search   (LIST, 搜索 20/s + 详情 80/s 独立桶, N worker)
@@ -80,7 +80,7 @@ PostgreSQL
 **改造点：搜索任务也进 Redis（不再 produce 端单进程串行）**。
 - producer 只负责**生成任务**：城市×关键词×页码 笛卡尔积入队（+ 公司号入队），不直接发搜索请求
 - 搜索 worker 多进程消费搜索队列，每任务 = 一次搜索页请求 → 产出岗位号入详情队列
-- 压测证据（2026-08-08）：sou 搜索 max 33.5 req/s **0 触发防线**；详情 detailv2 峰值 111 req/s、**稳定 ~70/s（单 IP 服务器软限）**——据此拆独立双桶：搜索 20/s（风控敏感）+ 详情 80/s
+- 2026-08-10 校正：旧探针受 curl_cffi 默认 `max_clients=10` 和单岗位热点样本限制。3 个实时岗位、池 40 持续 180 秒达到 207.6/s（37,443 成功、78 次 211、0 其他异常）；池 80/120 的 60 秒档为 223.6/229.3/s，但延迟显著上升。默认桶仍保持搜索 20/s、详情 80/s，提升前需更长生产形态压测。
 
 **为什么搜索与详情分队列**：任务类型不同、消费逻辑不同（搜索任务消费后**产出新任务**，详情任务消费后**入库**）。分队列可独立调并发，但**限速共享**（见下）。
 
@@ -90,13 +90,16 @@ PostgreSQL
 1. **任务级**：任务 id 用 `SADD seen` 去重——`keyword:城市:关键词:页码` 和 `company:公司号` 各自唯一，producer 幂等
 2. **岗位号级**：搜索产出的 number 跨任务重复命中（同一岗位被多个关键词搜到），详情队列 `SADD seen` 去重——**已有机制，不需要新增**
 
-**防崩溃（复用现有）**：
-- `processing` HASH(number→claimed_at) + `recover_stale()` 分布式锁回收 → worker 崩溃不丢任务
-- `attempts` HASH + HINCRBY + EXPIRE → 失败重试 3 次后标记 failed，无内存泄漏
+**防崩溃**：
+- Lua 原子执行去重+入队、完成、失败和回收状态转换
+- `BLMOVE queue → processing:list` 原子领取；即使领取后未写时间戳就崩溃，staging list 仍可回收
+- `processing` HASH 保存 Redis 服务器时间；搜索任务每页 heartbeat 续租
+- 每次领取生成 claim token；旧 worker 的 token 无法完成、续租或重试已回收的新租约
+- `attempts` HASH + EXPIRE 管理重试；`done_count` 计数器替代百万级 done SET
 - `seen` SET 去重 → 跨 producer 幂等
 - 类型前缀（`keyword:`/`company:`/`position:`）区分任务类型，同一套键结构照搬
 
-**限速（分桶）**：`RedisRateLimiter` 滑动窗口 Lua，搜索/详情各自独立令牌桶（默认 搜索 20/s + 详情 80/s）。拆桶依据压测：搜索 max 33.5/s、详情 max 111/s（稳定 ~70/s，单 IP 服务器软限）均 0 防线升级；且详情 detailv2 无 IP 信誉依赖可高频、搜索风控敏感保持低频。并发由各队列 worker 数控制（`--search-concurrency`/`--concurrency` 独立）。
+**限速（分桶）**：`RedisRateLimiter` 使用 Redis 服务器时间的滑动窗口 Lua。key 按 `ZHAOPIN_EGRESS_ID` 区分出口，再分 search/detail；不同出口不会错误共享同一总桶。
 
 ## 5. 阶段衔接
 
@@ -110,9 +113,10 @@ PostgreSQL
 
 ## 6. 速率与风控纪律
 
-- **搜索/详情分桶**（实测 2026-08-08）：搜索 max 33.5 req/s、详情 max 111 req/s（**稳定 ~70/s，单 IP 服务器软限**）均 0 防线升级 → 独立双桶 搜索 20/s + 详情 80/s
-- **并发独立控制**：搜索/详情协程数各自独立（`--search-concurrency` / `--concurrency`），够打满对应桶即可，不互相拖累（实测详情并发 10 已达单 IP ~70/s 上限，加协程无提升）
-- 风控状态机（`utils/risk.py`）照常接入：防线分级/指数冷却/token 缓存，跨 run 持久化
+- **搜索/详情分桶**：默认搜索 20/s、详情 80/s，均为保守生产配置，不再表述为服务端硬上限
+- **连接池显式跟随并发**：不会再被 curl_cffi 默认 `max_clients=10` 静默截断
+- **共享风控**：异步生产路径使用 Redis 状态机，同一 `ZHAOPIN_EGRESS_ID` 的 worker 共享冷却窗口
+- **211 有限重试**：有效岗位在高并发下可能偶发 211 后恢复 200，不能单次判定永久失效
 - 遇交互验证码自动冷却重试，不硬闯（IP 长期被标记时，状态机会自动降速，无需预先保守）
 
 ## 7. run.py 一键配置（待实现）

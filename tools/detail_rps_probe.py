@@ -4,7 +4,7 @@
 
 用法:
   py tools/detail_rps_probe.py --concs "1,5,10,20,40,80,120"
-  py tools/detail_rps_probe.py --number CC1234567890J... --concs "10,20"
+  py tools/detail_rps_probe.py --numbers CC1234567890J... --concs "10,20"
 
 设计:
   - 从 Redis position:queue 取几个真实岗位号 (只 lrange 读, 不消费不中断任务)
@@ -60,7 +60,7 @@ async def _get_real_numbers(count: int) -> list:
         items = await r.lrange("zhaopin:tasks:position:queue", 0, count * 2 - 1)
         await r.aclose()
         nums = [x.split(":", 1)[1] for x in items if x.startswith("position:")]
-        return nums[:count]
+        return nums[:count] or ["CC541117820J40384299213"] * count
     except Exception as e:  # noqa: BLE001
         print(f"从 Redis 取岗位号失败: {e}, 用内置测试号")
         return ["CC541117820J40384299213"] * count
@@ -85,8 +85,10 @@ async def _fetch(session, number: str) -> tuple[int, float, str]:
         return resp.status_code, dt, "NONJSON"
 
 
-async def _run_stage(concurrency: int, duration: float, numbers: list) -> dict:
-    session = cffi_requests.AsyncSession(impersonate="chrome",
+async def _run_stage(concurrency: int, duration: float, numbers: list,
+                     max_clients: int = 0) -> dict:
+    pool = max_clients or concurrency
+    session = cffi_requests.AsyncSession(impersonate="chrome", max_clients=pool,
                                          curl_infos=[CurlInfo.STARTTRANSFER_TIME,
                                                      CurlInfo.TOTAL_TIME])
     ok = fail = died = err = 0
@@ -94,14 +96,15 @@ async def _run_stage(concurrency: int, duration: float, numbers: list) -> dict:
     start = time.perf_counter()
     end = start + duration
     idx = 0
+    stop = asyncio.Event()
 
     async def _worker():
         nonlocal ok, fail, died, err, idx
-        while time.perf_counter() < end:
+        while time.perf_counter() < end and not stop.is_set():
             num = numbers[idx % len(numbers)]
             idx += 1
             try:
-                sc, dt, feat = await _fetch(session, num)
+                _status, dt, feat = await _fetch(session, num)
                 if feat == "OK":
                     ok += 1
                     lat.append(dt)
@@ -111,9 +114,11 @@ async def _run_stage(concurrency: int, duration: float, numbers: list) -> dict:
                 elif feat == "NONJSON":
                     err += 1
                     fail += 1
+                    stop.set()
                 else:
                     err += 1
                     fail += 1
+                    stop.set()
             except Exception:  # noqa: BLE001
                 fail += 1
             await asyncio.sleep(0.005)
@@ -126,6 +131,7 @@ async def _run_stage(concurrency: int, duration: float, numbers: list) -> dict:
     n = len(lat)
     return {
         "concurrency": concurrency,
+        "max_clients": pool,
         "rps": ok / dur,
         "ok": ok, "fail": fail, "died": died, "err": err,
         "lat50": lat[n // 2] * 1000 if n else 0,
@@ -137,6 +143,8 @@ async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--concs", default="1,5,10,20,40,80,120")
     ap.add_argument("--each", type=float, default=4.0)
+    ap.add_argument("--max-clients", type=int, default=0,
+                    help="每档连接池上限, 默认等于并发")
     ap.add_argument("--numbers", default="", help="逗号分隔岗位号, 默认从 Redis 取")
     args = ap.parse_args()
     concs = [int(x) for x in args.concs.split(",")]
@@ -144,15 +152,19 @@ async def main() -> None:
         numbers = args.numbers.split(",")
     else:
         numbers = await _get_real_numbers(3)
-    print(f"探针: 岗位号={numbers} 并发档位={concs} 每档{args.each}s")
+    print(f"探针: 岗位号={numbers} 并发档位={concs} 每档{args.each}s "
+          f"连接池={args.max_clients or '跟随并发'}")
     print("注意: 叠加在运行中 consume (详情80/s) 之上, 触发风控即停.")
-    print(f"{'并发':>4} {'成功':>6} {'失败':>5} {'失效211':>6} {'RPS':>6} "
-          f"{'TTFB50ms':>8} {'TTFB95ms':>8} {'标记':>8}")
+    print(f"{'并发':>4} {'池':>4} {'成功':>6} {'失败':>5} {'失效211':>6} {'RPS':>6} "
+          f"{'LAT50ms':>8} {'LAT95ms':>8} {'标记':>8}")
     for c in concs:
-        r = await _run_stage(c, args.each, numbers)
-        flag = "验证码" if r["err"] > 0 else "-"
-        print(f"{r['concurrency']:>4} {r['ok']:>6} {r['fail']:>5} {r['died']:>6} "
+        r = await _run_stage(c, args.each, numbers, args.max_clients)
+        flag = "业务异常" if r["err"] > 0 else "-"
+        print(f"{r['concurrency']:>4} {r['max_clients']:>4} {r['ok']:>6} {r['fail']:>5} {r['died']:>6} "
               f"{r['rps']:>6.1f} {r['lat50']:>8.1f} {r['lat95']:>8.1f} {flag:>8}")
+        if r["err"] > 0:
+            print("检测到非 211 业务异常或非 JSON 响应，停止探测。")
+            return
         await asyncio.sleep(2.0)
 
 

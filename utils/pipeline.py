@@ -20,7 +20,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List
 
 from utils.async_client import (
@@ -79,10 +79,14 @@ class Pipeline:
                   "name": self.cfg.name}
         run_id = await self.storage.start_run("pipeline", params)
         # 搜索/详情各一个 client (name 区分统计 stage), 共享同一限速器
-        search_client = AsyncZhilianClient(risk=self.risk, rate_limiter=self.rate_limiter,
-                                           stats=self.stats, name="search")
-        detail_client = AsyncZhilianClient(risk=self.risk, rate_limiter=self.rate_limiter,
-                                           stats=self.stats, name="detail")
+        search_client = AsyncZhilianClient(
+            risk=self.risk, rate_limiter=self.rate_limiter,
+            stats=self.stats, name="search",
+            max_clients=max(1, self.cfg.search_concurrency))
+        detail_client = AsyncZhilianClient(
+            risk=self.risk, rate_limiter=self.rate_limiter,
+            stats=self.stats, name="detail",
+            max_clients=max(1, self.cfg.detail_concurrency))
         try:
             producers = [asyncio.create_task(self._search_worker(search_client, kw))
                          for kw in self.cfg.keywords]

@@ -54,18 +54,20 @@ async def _fetch(session, city: str, kw: str, page: int) -> tuple[int, float, st
 
 
 async def _run_stage(concurrency: int, duration: float, city: str, kw: str,
-                     page: int) -> dict:
+                     page: int, max_clients: int = 0) -> dict:
     """跑一档: 固定并发, 持续 duration 秒, 统计成功/失败/RPS/延迟/风控。"""
-    session = cffi_requests.AsyncSession(impersonate="chrome",
+    pool = max_clients or concurrency
+    session = cffi_requests.AsyncSession(impersonate="chrome", max_clients=pool,
                                          curl_infos=[CurlInfo.STARTTRANSFER_TIME,
                                                      CurlInfo.TOTAL_TIME])
     ok = fail = captcha = challenge = 0
     lat: list[float] = []
     start = time.perf_counter()
     end = start + duration
+    stop = asyncio.Event()
     async def _worker():
         nonlocal ok, fail, captcha, challenge
-        while time.perf_counter() < end:
+        while time.perf_counter() < end and not stop.is_set():
             try:
                 code, ttfb, feat = await _fetch(session, city, kw, page)
                 if code == 200 and feat == "OK":
@@ -74,9 +76,11 @@ async def _run_stage(concurrency: int, duration: float, city: str, kw: str,
                 elif feat == "CAPTCHA":
                     captcha += 1
                     fail += 1
+                    stop.set()
                 elif feat == "CHALLENGE":
                     challenge += 1
                     fail += 1
+                    stop.set()
                 else:
                     fail += 1
             except Exception as e:  # noqa: BLE001
@@ -94,6 +98,7 @@ async def _run_stage(concurrency: int, duration: float, city: str, kw: str,
     n = len(lat)
     return {
         "concurrency": concurrency,
+        "max_clients": pool,
         "rps": ok / dur,
         "ok": ok, "fail": fail,
         "captcha": captcha, "challenge": challenge,
@@ -108,22 +113,26 @@ async def main() -> None:
     ap.add_argument("--kw", default="SMT")
     ap.add_argument("--concs", default="1,2,5,10,20,30,50")
     ap.add_argument("--each", type=float, default=5.0, help="每档持续时间(秒)")
+    ap.add_argument("--max-clients", type=int, default=0,
+                    help="每档连接池上限, 默认等于并发")
     ap.add_argument("--page", type=int, default=1)
     args = ap.parse_args()
     concs = [int(x) for x in args.concs.split(",")]
     print(f"探针: city={args.city} kw={args.kw} page={args.page} "
-          f"并发档位={concs} 每档{args.each}s")
+          f"并发档位={concs} 每档{args.each}s "
+          f"连接池={args.max_clients or '跟随并发'}")
     print("注意: 探针叠加在运行中 consume 之上, 发现风控标记即停.")
-    print(f"{'并发':>4} {'成功':>6} {'失败':>5} {'RPS':>6} {'TTFB50ms':>8} "
-          f"{'TTFB95ms':>8} {'风控标记':>10}")
+    print(f"{'并发':>4} {'池':>4} {'成功':>6} {'失败':>5} {'RPS':>6} {'LAT50ms':>8} "
+          f"{'LAT95ms':>8} {'风控标记':>10}")
     for c in concs:
-        r = await _run_stage(c, args.each, args.city, args.kw, args.page)
+        r = await _run_stage(c, args.each, args.city, args.kw, args.page,
+                             args.max_clients)
         flag = []
         if r["captcha"]:
             flag.append(f"验证码{r['captcha']}")
         if r["challenge"]:
             flag.append(f"challenge{r['challenge']}")
-        print(f"{r['concurrency']:>4} {r['ok']:>6} {r['fail']:>5} "
+        print(f"{r['concurrency']:>4} {r['max_clients']:>4} {r['ok']:>6} {r['fail']:>5} "
               f"{r['rps']:>6.1f} {r['lat50']:>8.1f} {r['lat95']:>8.1f} "
               f"{'/'.join(flag) if flag else '-':>10}")
         # 风控触发则提前终止, 避免打爆 IP

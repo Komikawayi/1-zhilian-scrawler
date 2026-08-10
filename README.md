@@ -190,8 +190,9 @@ py main.py --detail --detail-urls "https://www.zhaopin.com/jobdetail/CCL14801178
 
 ### 规模化验证
 
-- **分桶限速压测（2026-08-08）**：搜索 max 33.5 req/s、详情 111 req/s 峰值均 0 防线升级 → 拆独立双桶：搜索 20/s（风控敏感）+ 详情 80/s
-- **详情单 IP 软限（2026-08-08 复测）**：detailv2 稳定吞吐 **~70/s**（并发 10/20/30/40、纯请求/含写库实测一致）——智联对高频 detailv2 静默限速，80/s 桶实际 ~70/s；**搜索未受限**（max 32/s）
+- **连接池校正（2026-08-10）**：旧探针未设置 `max_clients`，被 curl_cffi 默认连接池 10 截断，不能据此认定服务端存在 `~70/s` 硬上限
+- **详情持续探针（2026-08-10）**：3 个实时有效岗位、池 40 持续 180 秒，**37,443 成功 / 78 次 211 / 0 其他异常，207.6 req/s**；池 80/120 的 60 秒档为 223.6/229.3 req/s，但 p95 从 585ms 升到 804ms，继续加并发收益很低
+- **211 语义校正**：高并发下观察到有效岗位偶发 211 后恢复 200，生产改为最多 3 次队列重试，不再单次即永久丢弃
 - **分布式链路（2026-08-08）**：2 关键词页 → 31 家公司补采 → **1382 岗位 0 失败**；4 worker 压测 2282 岗位全 done；紫光未来 32/32 精确补采
 - **历史基准**：448 条顺序压测 100% 成功（0.54/s）；Phase B Redis 1705 条 100%（~114s）
 
@@ -218,8 +219,8 @@ docker update --restart unless-stopped zhilian-postgres
 ### 测试
 
 ```powershell
-py -m pytest tests/ -v                          # 固定输入自检 (challenge 求解 + v2/SSR 详情解析 + 队列/存储)
-ZHAOPIN_NETWORK_TEST=1 py -m pytest tests/ -v   # 含真实网络测试
+py -m pytest tests/ -v                              # 固定输入自检
+$env:ZHAOPIN_NETWORK_TEST=1; py -m pytest tests/ -v # PowerShell 含真实网络测试
 ```
 
 ### collect.py 常用选项
@@ -234,11 +235,11 @@ ZHAOPIN_NETWORK_TEST=1 py -m pytest tests/ -v   # 含真实网络测试
 --companies <号>         公司号列表 (生成 company: 补采任务)
 --pages <n>              仅 --single 单机模式生效 (每关键词页数; produce 自动翻页无上限)
 --workers <n>            消费 worker 进程数
---concurrency <n>        详情并发协程数/worker (默认 10, 够单IP~70/s)
+--concurrency <n>        详情并发协程数/worker (同时作为该 worker 的连接池下限)
 --search-concurrency <n> 搜索并发协程数/worker (默认 10, 打满 20/s 桶)
 --rate <n>               [兼容] 全局旧限速 (搜索+详情同值; 优先用分桶参数)
 --search-rate <n>        搜索桶限速 req/s (默认 20, 风控敏感)
---detail-rate <n>        详情桶限速 req/s (默认 80; 服务器单IP软限~70/s)
+--detail-rate <n>        详情桶限速 req/s (默认 80; 提高前需持续压测)
 --clear                  produce 前清空对应队列
 --db <url>               PostgreSQL URL
 --redis <url>            Redis URL
@@ -332,10 +333,10 @@ docs/                       逆向分析文档 + 架构方案
 
 ## 风控状态机（utils/risk.py）
 
-采集全程接入跨 run 持久化的 IP 信誉状态机（`config/zhilian-risk.local.json`，gitignored）：
+生产分布式路径把状态存入 Redis `zhaopin:risk:{ZHAOPIN_EGRESS_ID}`，同一出口的 worker 跨进程/run 共享冷却；legacy SSR 路径仍使用 `config/zhilian-risk.local.json` 保存 token 和状态：
 
 - **防线分级**：`ok(直通) → challenge(JS挑战,可解) → captcha(交互验证码,需冷却) → cooling`
-- **自适应速率**：challenge 期间请求间隔 ×2，冷却期 ×4（配合 `http_client` 限速）
+- **自适应速率**：legacy `http_client` 在 challenge/cooling 时降速；分布式路径共享 Redis 冷却并使用固定滑动窗口桶
 - **指数冷却**：验证码触发后 60s/120s/240s… 递增（上限 30min），跨 run 记忆，下次启动自动等完冷却
 - **EO-Bot-Js-Token 缓存**：挑战 token 1h 复用，不再每请求重复执行 Node
 - **搜索路径风控重试**：单页触发验证码自动冷却后重试（3 轮），不再硬中断整批

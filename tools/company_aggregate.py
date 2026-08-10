@@ -64,7 +64,7 @@ def _where(args: argparse.Namespace) -> tuple[str, List]:
         params.append(f"%{args.kw}%")
     if args.company_file:
         with open(args.company_file, encoding="utf-8") as f:
-            nums = [l.strip() for l in f if l.strip()]
+            nums = [line.strip() for line in f if line.strip()]
         if nums:
             conds.append("company_number = ANY($%d)" % (len(params) + 1))
             params.append(nums)

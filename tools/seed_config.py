@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from typing import List
 
 # 51job 城市 profile 路径 (桌面项目, 跨盘引用)

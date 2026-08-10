@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
+import uuid
 
-from utils.async_client import AsyncRateLimiter
+import pytest
+import redis.asyncio as aioredis
+
+from utils.async_client import AsyncRateLimiter, RedisRateLimiter
 
 
 async def _elapsed(coro):
@@ -52,3 +57,32 @@ def test_concurrent_workers_share_rate():
     t = asyncio.run(_())
     # 3 worker × 10 = 30 次, 首轮突发 20, 后 10 个按 20/s -> ~0.5s
     assert 0.2 < t < 1.5
+
+
+def test_redis_rate_limiter_shared_and_precise_wait():
+    """两个实例共享滑动窗口，拒绝后按服务端返回时间等待。"""
+    async def _():
+        redis = aioredis.from_url("redis://127.0.0.1:6379/15",
+                                  decode_responses=True)
+        key = "zhaopin:test:ratelimit:" + uuid.uuid4().hex
+        connected = False
+        try:
+            try:
+                await redis.ping()
+            except Exception:
+                pytest.skip("Redis 不可用")
+            connected = True
+            a = RedisRateLimiter(redis, 10, key=key)
+            b = RedisRateLimiter(redis, 10, key=key)
+            start = time.perf_counter()
+            await asyncio.gather(
+                *(a.acquire() for _ in range(10)),
+                *(b.acquire() for _ in range(10)),
+            )
+            return time.perf_counter() - start
+        finally:
+            if connected:
+                await redis.delete(key, key + ":seq")
+            await redis.aclose()
+    elapsed = asyncio.run(_())
+    assert 0.8 < elapsed < 2.5

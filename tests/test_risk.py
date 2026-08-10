@@ -2,9 +2,17 @@
 """RiskState 风控状态机自检: 状态转移 / token 缓存 / 冷却 / 持久化."""
 from __future__ import annotations
 
+import asyncio
 import time
+import uuid
+from unittest.mock import patch
 
-from utils.risk import RiskState, STATE_OK, STATE_CHALLENGE, STATE_COOLING
+import pytest
+import redis.asyncio as aioredis
+
+from utils.risk import (
+    AsyncRedisRiskState, RiskState, STATE_OK, STATE_CHALLENGE, STATE_COOLING,
+)
 
 
 def _make_risk(tmp_path):
@@ -95,3 +103,63 @@ def test_await_cooldown_blocks(tmp_path):
     r.await_cooldown()
     assert time.time() - t0 >= 0.15  # 确实阻塞了
     assert not r.is_cooling()
+
+
+def test_async_redis_risk_is_shared():
+    """多个 worker 使用同一 scope 时共享 challenge/cooling 状态。"""
+    async def _():
+        redis = aioredis.from_url("redis://127.0.0.1:6379/15",
+                                  decode_responses=True)
+        key_scope = "test-" + uuid.uuid4().hex
+        a = AsyncRedisRiskState(redis, scope=key_scope)
+        b = AsyncRedisRiskState(redis, scope=key_scope)
+        connected = False
+        try:
+            try:
+                await redis.ping()
+            except Exception:
+                pytest.skip("Redis 不可用")
+            connected = True
+            await a.async_on_challenge()
+            await a.async_on_challenge()
+            await b.async_await_cooldown()
+            assert b.state == STATE_CHALLENGE
+            await b.async_on_challenge()
+            await a._refresh()
+            assert a.state == STATE_COOLING
+            await a.async_on_success()
+            assert a.state == STATE_COOLING  # 在途成功不能提前解除共享冷却
+            await redis.hset(a.key, "cooling_until", time.time() - 1)
+            await a.async_on_success()
+            assert a.state == STATE_OK
+        finally:
+            if connected:
+                await redis.delete(a.key)
+            await redis.aclose()
+    asyncio.run(_())
+
+
+def test_async_redis_risk_uses_server_time():
+    """冷却截止时间不能受 worker 本机时钟偏差影响。"""
+    async def _():
+        redis = aioredis.from_url("redis://127.0.0.1:6379/15",
+                                  decode_responses=True)
+        risk = AsyncRedisRiskState(redis, scope="test-" + uuid.uuid4().hex)
+        connected = False
+        try:
+            try:
+                await redis.ping()
+            except Exception:
+                pytest.skip("Redis 不可用")
+            connected = True
+            server_clock = await redis.time()
+            server_now = float(server_clock[0]) + float(server_clock[1]) / 1000000
+            with patch("utils.risk.time.time", return_value=server_now + 86400):
+                await risk.async_on_captcha()
+            cooling_until = float(await redis.hget(risk.key, "cooling_until"))
+            assert 55 <= cooling_until - server_now <= 65
+        finally:
+            if connected:
+                await redis.delete(risk.key)
+            await redis.aclose()
+    asyncio.run(_())

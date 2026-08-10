@@ -152,6 +152,88 @@ def test_recover_lock_single():
     _run(_())
 
 
+def test_recover_claim_staging_without_timestamp():
+    """领取后 worker 在写 processing 时间戳前崩溃, staging 任务仍可回收。"""
+    _clear()
+    async def _():
+        q = TaskQueue(TEST_URL)
+        try:
+            await q.enqueue("STAGING")
+            claimed = await q.redis.blmove(q._queue, q._processing_list,
+                                           timeout=1, src="LEFT", dest="RIGHT")
+            assert claimed == "STAGING"
+            assert await q.recover_stale(max_age=120) == 1
+            assert await q.dequeue(timeout=1) == "STAGING"
+        finally:
+            await q.close()
+    _run(_())
+
+
+def test_done_counter_migrates_legacy_set():
+    """旧 done 集合首次读取时迁移为计数器并释放集合。"""
+    _clear()
+    async def _():
+        q = TaskQueue(TEST_URL)
+        try:
+            await q.redis.sadd(q._done, "A", "B")
+            stats = await q.stats()
+            assert stats["done"] == 2
+            assert not await q.redis.exists(q._done)
+            await q.enqueue("C")
+            await q.dequeue(timeout=1)
+            await q.complete("C")
+            assert (await q.stats())["done"] == 3
+        finally:
+            await q.close()
+    _run(_())
+
+
+def test_legacy_processing_hash_migrates():
+    """升级前仅在 processing hash 的任务会补入 staging 并正常回收。"""
+    _clear()
+    async def _():
+        q = TaskQueue(TEST_URL)
+        try:
+            await q.redis.hset(q._processing, "LEGACY", str(time.time() - 200))
+            assert (await q.stats())["processing"] == 1
+            assert await q.recover_stale(max_age=120) == 1
+            assert await q.dequeue(timeout=1) == "LEGACY"
+        finally:
+            await q.close()
+    _run(_())
+
+
+def test_recovered_claim_is_fenced_from_new_claim():
+    """旧 worker 在任务回收并重新领取后不能完成或重试新租约。"""
+    _clear()
+    async def _():
+        q = TaskQueue(TEST_URL)
+        try:
+            await q.redis.delete("zhaopin:lock:recover:position")
+            await q.enqueue("LEASE")
+            old_claim = await q.dequeue(timeout=1)
+            assert old_claim == "LEASE"
+            await q.redis.hset(q._processing, "LEASE", str(time.time() - 200))
+            assert await q.recover_stale(max_age=120) == 1
+
+            new_claim = await q.dequeue(timeout=1)
+            assert new_claim == "LEASE"
+            assert q.claim_token(old_claim) != q.claim_token(new_claim)
+            assert await q.heartbeat(old_claim) is False
+            assert await q.complete(old_claim) is False
+            assert await q.fail(old_claim, max_attempts=2) is None
+            stats = await q.stats()
+            assert stats["processing"] == 1
+            assert stats["queue"] == stats["done"] == stats["failed"] == 0
+
+            assert await q.complete(new_claim) is True
+            stats = await q.stats()
+            assert stats["processing"] == 0 and stats["done"] == 1
+        finally:
+            await q.close()
+    _run(_())
+
+
 # ====================================================================
 # 双队列 (搜索/详情) + 任务类型前缀
 # ====================================================================

@@ -13,7 +13,7 @@
 
 搜索/详情各自独立 Redis 滑动窗口限速桶 (默认 搜索 20/s + 详情 80/s,
 搜索风控敏感保持低频, 详情无 IP 信誉依赖可高频);
-风控状态机跨 run 持久化 (utils/risk.py)。
+风控状态机通过 Redis 按出口身份跨 worker/run 共享 (utils/risk.py)。
 
 用法:
   py collect.py --produce --kw smt,pcba --cities 653,530        # 建搜索任务池 (自动翻完所有页)
@@ -32,23 +32,23 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict
 from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import settings
 from utils.async_client import (
-    AsyncRateLimiter, AsyncZhilianClient, PermanentPositionError, RedisRateLimiter,
+    AsyncZhilianClient, PositionUnavailableError, RedisRateLimiter,
     fetch_position_detail_v2_async,
 )
 from utils.latency_stats import LatencyStats
 from utils.parser import extract_initial_state, parse_position_detail_v2
 from utils.pipeline import Pipeline, PipelineConfig
-from utils.risk import RiskState
+from utils.risk import AsyncRedisRiskState
 from utils.storage_pg import AsyncStorage
 from utils.task_queue import (
-    QUEUE_POSITION, QUEUE_SEARCH, TASK_COMPANY, TASK_KEYWORD, TASK_POSITION,
+    QUEUE_POSITION, QUEUE_SEARCH, TASK_COMPANY, TASK_KEYWORD,
     TaskQueue,
 )
 
@@ -139,10 +139,10 @@ def parse_args() -> argparse.Namespace:
                     help="搜索并发协程数/worker (搜索桶 20/s 需全局 ≥12; 默认 10)")
     ap.add_argument("--rate", type=float, default=settings.DETAIL_RATE_PER_SEC,
                     help="[兼容] 全局旧限速; 用 --search-rate/--detail-rate 分桶")
-    ap.add_argument("--search-rate", type=float, default=20.0,
-                    help="搜索桶限速 req/s (IP 信誉敏感, 实测 33/s 安全)")
-    ap.add_argument("--detail-rate", type=float, default=80.0,
-                    help="详情桶限速 req/s (实测 111/s 无风控)")
+    ap.add_argument("--search-rate", type=float, default=settings.SEARCH_RATE_PER_SEC,
+                    help="搜索桶限速 req/s (IP 信誉敏感)")
+    ap.add_argument("--detail-rate", type=float, default=settings.DETAIL_RATE_PER_SEC,
+                    help="详情桶限速 req/s (提高前需持续压测)")
     ap.add_argument("--max-attempts", type=int, default=settings.MAX_ATTEMPTS,
                     help="任务失败重试次数")
     # 环境
@@ -199,9 +199,8 @@ class WorkerConfig:
     db_url: str
     concurrency: int = 10
     search_concurrency: int = 10       # 每 worker 搜索协程数 (够打满 20/s 搜索桶)
-    rate_per_sec: float = 15.0       # 兼容旧参数 (--rate)
-    search_rate: float = 20.0        # 搜索桶限速 (IP 信誉敏感, 实测 33/s 安全)
-    detail_rate: float = 80.0        # 详情桶限速 (实测 111/s 无风控)
+    search_rate: float = 20.0        # 搜索桶限速 (IP 信誉敏感)
+    detail_rate: float = 80.0        # 详情桶保守生产值
     max_attempts: int = 3
     worker_id: int = 0
 
@@ -241,6 +240,7 @@ async def _consume_keyword_task(queue, client, storage, pos_queue, task_id: str,
     added = 0
     matched_pages = 0   # 连续空页计数 (SSR 无 pages 时兜底终止)
     for page in range(1, max_pages + 1):
+        await queue.heartbeat(task_id)
         html = await _search_page_async(client, city, kw, page)
         t0 = time.perf_counter()
         state = extract_initial_state(html)
@@ -295,6 +295,7 @@ async def _consume_company_task(queue, client, storage, pos_queue, task_id: str,
     added = 0
     matched_pages = 0   # 连续"无目标公司岗位"页计数 (SSR 无 pages 时兜底终止)
     for page in range(1, max_pages + 1):
+        await queue.heartbeat(task_id)
         html = await _search_page_async(client, "0", company_name, page)
         t0 = time.perf_counter()
         state = extract_initial_state(html)
@@ -416,12 +417,12 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
                 "zhaopin:last_consume:detail",
                 f"{row.get('position_name', '')[:18]}|{row.get('work_city', '')}",
                 ex=60)
-        except PermanentPositionError as e:
-            # 岗位已失效 (211): 永久性, 直接标 failed 不入队重试 (跳过是默认行为,
-            # 静默处理, 仅 info 留档不刷终端)
+        except PositionUnavailableError:
+            # 高并发下观察到有效岗位偶发 211 后恢复 200，按普通任务有限重试；
+            # 真正下架的岗位达到 max_attempts 后仍会进入 failed。
             fail += 1
-            logger.info("详情 %s 岗位失效(211), 跳过", number)
-            await queue.fail_permanent(task_id)
+            logger.info("详情 %s 暂不可用(211), 有限重试", number)
+            await queue.fail(task_id, max_attempts=cfg.max_attempts)
         except Exception as e:  # noqa: BLE001
             fail += 1
             # 终端默认只留 WARNING, 偶发 curl 断连重试会刷屏 → 只记 ERROR (final 失败)
@@ -588,14 +589,19 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
     """
     search_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_SEARCH)
     pos_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_POSITION)
-    search_limiter = RedisRateLimiter(search_q.redis, cfg.search_rate, key="zhaopin:ratelimit:search")
-    detail_limiter = RedisRateLimiter(search_q.redis, cfg.detail_rate, key="zhaopin:ratelimit:detail")
-    risk = RiskState()
+    limiter_prefix = f"zhaopin:ratelimit:{settings.EGRESS_ID}"
+    search_limiter = RedisRateLimiter(
+        search_q.redis, cfg.search_rate, key=f"{limiter_prefix}:search")
+    detail_limiter = RedisRateLimiter(
+        search_q.redis, cfg.detail_rate, key=f"{limiter_prefix}:detail")
+    risk = AsyncRedisRiskState(search_q.redis, scope=settings.EGRESS_ID)
     stats = LatencyStats()   # 分环节耗时统计 (实时均值 + 结束总结)
     search_client = AsyncZhilianClient(risk=risk, rate_limiter=search_limiter,
-                                       stats=stats, name="search")
+                                       stats=stats, name="search",
+                                       max_clients=max(1, cfg.search_concurrency))
     detail_client = AsyncZhilianClient(risk=risk, rate_limiter=detail_limiter,
-                                       stats=stats, name="detail")
+                                       stats=stats, name="detail",
+                                       max_clients=max(1, cfg.concurrency))
     storage = await AsyncStorage.create(cfg.db_url)
     # watchdog 独立 Task: 消费 loop 全退后 cancel, 否则 gather 永不返回 (流程不收敛)
     watchdog = asyncio.create_task(_watchdog(search_q, pos_q))
@@ -640,7 +646,6 @@ def _consume(args) -> None:
     cfg_list = [WorkerConfig(redis_url=args.redis, db_url=args.db,
                              concurrency=args.concurrency,
                              search_concurrency=args.search_concurrency,
-                             rate_per_sec=args.rate,
                              search_rate=args.search_rate, detail_rate=args.detail_rate,
                              max_attempts=args.max_attempts, worker_id=i)
                 for i in range(workers)]
@@ -653,6 +658,14 @@ def _consume(args) -> None:
         p.start()
     for p in procs:
         p.join()
+    failed_workers = [
+        f"worker-{i}(exitcode={p.exitcode})"
+        for i, p in enumerate(procs) if p.exitcode != 0
+    ]
+    if failed_workers:
+        message = "; ".join(failed_workers)
+        logger.error("采集 worker 异常退出: %s", message)
+        raise RuntimeError(f"采集未完成: {message}")
     # 任务总耗时 (各 worker 的分环节统计表已各自打印到终端+日志)
     print(f"采集完成: 总耗时 {_fmt_elapsed(time.time() - started)}, 日志见 output/logs/")
 

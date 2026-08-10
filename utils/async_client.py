@@ -66,9 +66,10 @@ class RedisRateLimiter:
 
     _LUA = """
 local key = KEYS[1]
-local now = tonumber(ARGV[1])
-local window_ms = tonumber(ARGV[2])
-local limit = tonumber(ARGV[3])
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local window_ms = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
 redis.call('ZREMRANGEBYSCORE', key, 0, now - window_ms)
 local count = redis.call('ZCARD', key)
 if count < limit then
@@ -76,9 +77,13 @@ if count < limit then
   redis.call('ZADD', key, now, now .. '-' .. seq)
   redis.call('EXPIRE', key, math.ceil(window_ms / 1000))
   redis.call('EXPIRE', key .. ':seq', math.ceil(window_ms / 1000))
+  return 0
+end
+local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+if #oldest == 0 then
   return 1
 end
-return 0
+return math.max(1, tonumber(oldest[2]) + window_ms - now)
 """
 
     def __init__(self, redis, rate_per_sec: float, key: str = "zhaopin:ratelimit:sw"):
@@ -91,11 +96,11 @@ return 0
             return
         window_ms = 1000
         while True:
-            ok = await self.redis.eval(self._LUA, 1, self.key,
-                                       int(time.time() * 1000), window_ms, self.rate)
-            if ok:
+            wait_ms = await self.redis.eval(self._LUA, 1, self.key,
+                                            window_ms, self.rate)
+            if wait_ms == 0:
                 return
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(wait_ms / 1000)
 
 
 class AsyncZhilianClient:
@@ -110,6 +115,7 @@ class AsyncZhilianClient:
         timeout: Optional[int] = None,
         stats: Optional[LatencyStats] = None,
         name: str = "",
+        max_clients: Optional[int] = None,
     ) -> None:
         self.impersonate = impersonate
         self.risk = risk
@@ -119,8 +125,10 @@ class AsyncZhilianClient:
         self.stats = stats
         self.name = name            # 统计 stage: "search" / "detail"
         # curl_infos: 每个响应自动携带 TTFB + 总耗时 (requests 层行为不变)
-        self.session = cffi_requests.AsyncSession(impersonate=impersonate,
-                                                  curl_infos=_NET_INFOS)
+        self.max_clients = max(1, max_clients or 10)
+        self.session = cffi_requests.AsyncSession(
+            impersonate=impersonate, max_clients=self.max_clients,
+            curl_infos=_NET_INFOS)
 
     async def get(self, url: str, **kw) -> cffi_requests.Response:
         return await self._request("get", url, **kw)
@@ -186,10 +194,10 @@ _FE_API_HEADERS = {
 }
 
 
-class PermanentPositionError(ConnectionError):
-    """岗位已永久失效 (apiCode=211: 已下架/过期/删除)。
+class PositionUnavailableError(ConnectionError):
+    """岗位详情暂不可用 (apiCode=211)。
 
-    重试无意义 → 消费方捕获后直接标记 failed, 不再入队重试 (见 collect.py)。
+    211 通常表示下架/过期，但高并发实测存在偶发 211 后恢复 200，消费方需有限重试。
     """
 
 
@@ -216,9 +224,8 @@ async def fetch_position_detail_v2_async(client: AsyncZhilianClient, number: str
         raise ConnectionError(f"position-detailv2 响应非 JSON: {e}") from e
     if body.get("code") != 200 or body.get("apiCode") != 200:
         if body.get("apiCode") == 211:
-            # 岗位已失效 (下架/过期/删除): 永久性, 重试无意义, 直接标记
-            raise PermanentPositionError(
-                f"position-detailv2 岗位失效 apiCode=211 {number}")
+            raise PositionUnavailableError(
+                f"position-detailv2 暂不可用 apiCode=211 {number}")
         raise ConnectionError(
             f"position-detailv2 业务错误 code={body.get('code')} apiCode={body.get('apiCode')} "
             f"msg={body.get('message')}")

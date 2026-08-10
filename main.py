@@ -40,7 +40,7 @@ from utils.http_client import ZhilianClient  # noqa: E402
 from utils.risk import RiskState  # noqa: E402
 from utils.output import write_csv  # noqa: E402
 from utils.parser import (  # noqa: E402
-    parse_meta, parse_positions, extract_initial_state, parse_job_detail, parse_position_detail_v2,
+    parse_positions, extract_initial_state, parse_job_detail, parse_position_detail_v2,
 )
 from utils.challenge import fetch_job_detail  # noqa: E402
 from utils.fe_api import fetch_position_detail_v2  # noqa: E402
@@ -136,7 +136,6 @@ def collect(
         rows.extend(page_rows)
     if rows:
         # 补充关键词/城市信息
-        meta = parse_meta(first_page_state) if first_page_state else {}
         for r in rows:
             r["keyword"] = keyword
             r["city_code"] = city

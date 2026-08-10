@@ -15,7 +15,7 @@ from typing import Optional
 from curl_cffi import requests as cffi_requests
 
 from config import settings
-from utils.risk import RiskState, STATE_CHALLENGE, STATE_COOLING
+from utils.risk import RiskState
 
 logger = logging.getLogger(__name__)
 
