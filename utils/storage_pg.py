@@ -103,11 +103,11 @@ class AsyncStorage:
 
     # ---- 写入 ----
 
-    async def upsert_position(self, row: Dict[str, str]) -> None:
+    @staticmethod
+    def _position_statement(row: Dict[str, str]):
         num = row.get("position_number") or row.get("task_id")
         if not num:
-            logger.warning("upsert_position 缺 number, 跳过: %s", str(row)[:80])
-            return
+            return None
         fields = [f for f in POSITION_FIELDS if f in row and f != "position_number"]
         cols = ["position_number"] + fields + ["source", "raw_json"]
         vals = [str(num)] + [str(row.get(f, "") or "") for f in fields]
@@ -120,24 +120,97 @@ class AsyncStorage:
                    "first_seen_at=COALESCE(positions.first_seen_at, now())"
         sql = f"INSERT INTO positions ({','.join(cols)}, first_seen_at) VALUES ({ph}, now()) " \
               f"ON CONFLICT(position_number) DO UPDATE SET {updates}"
-        async with self.pool.acquire() as conn:
-            await conn.execute(sql, *vals)
+        return sql, vals
 
-    async def upsert_company(self, row: Dict[str, str]) -> None:
+    @staticmethod
+    def _company_values(row: Dict[str, str]):
         num = row.get("company_number")
         if not num:
-            return
+            return None
+        return (
+            num, str(row.get("company_name", "") or ""),
+            str(row.get("company_size", "") or ""),
+            str(row.get("financing_stage", "") or ""),
+            str(row.get("industry_name", "") or ""),
+            str(row.get("company_description", "") or ""),
+        )
+
+    async def _upsert_position_on(self, conn, row: Dict[str, str]) -> bool:
+        statement = self._position_statement(row)
+        if statement is None:
+            logger.warning("upsert_position missing number, skipped: %s", str(row)[:80])
+            return False
+        sql, vals = statement
+        await conn.execute(sql, *vals)
+        return True
+
+    async def _upsert_company_on(self, conn, row: Dict[str, str]) -> bool:
+        vals = self._company_values(row)
+        if vals is None:
+            return False
+        await conn.execute(
+            "INSERT INTO companies (company_number, company_name, company_size, financing_stage, industry_name, description) "
+            "VALUES ($1,$2,$3,$4,$5,$6) "
+            "ON CONFLICT(company_number) DO UPDATE SET "
+            "company_name=EXCLUDED.company_name, company_size=EXCLUDED.company_size, "
+            "financing_stage=EXCLUDED.financing_stage, industry_name=EXCLUDED.industry_name, "
+            "description=EXCLUDED.description, fetched_at=now()",
+            *vals)
+
+        return True
+
+    async def upsert_position(self, row: Dict[str, str]) -> None:
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO companies (company_number, company_name, company_size, financing_stage, industry_name, description) "
-                "VALUES ($1,$2,$3,$4,$5,$6) "
-                "ON CONFLICT(company_number) DO UPDATE SET "
-                "company_name=EXCLUDED.company_name, company_size=EXCLUDED.company_size, "
-                "financing_stage=EXCLUDED.financing_stage, industry_name=EXCLUDED.industry_name, "
-                "description=EXCLUDED.description, fetched_at=now()",
-                num, str(row.get("company_name", "") or ""), str(row.get("company_size", "") or ""),
-                str(row.get("financing_stage", "") or ""), str(row.get("industry_name", "") or ""),
-                str(row.get("company_description", "") or ""))
+            await self._upsert_position_on(conn, row)
+
+    async def upsert_company(self, row: Dict[str, str]) -> None:
+        async with self.pool.acquire() as conn:
+            await self._upsert_company_on(conn, row)
+
+    async def upsert_position_and_company(self, position: Dict[str, str],
+                                          company: Dict[str, str]) -> None:
+        """Persist one detail response with one pool lease and one commit."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if await self._upsert_position_on(conn, position):
+                    await self._upsert_company_on(conn, company)
+
+    async def upsert_position_and_company_batch(self, rows) -> None:
+        """Persist a bounded batch with one connection and one transaction.
+
+        PostgreSQL 在 ``ON CONFLICT DO UPDATE`` 时会持有目标行锁。多 writer
+        若按响应到达顺序交错写入岗位和公司，重叠公司会形成反向锁顺序而死锁；
+        因此先按岗位号、再按公司号稳定排序，且同一公司在一个批次只更新一次。
+        """
+        positions = []
+        companies = {}
+        for position, company in rows:
+            statement = self._position_statement(position)
+            if statement is None:
+                logger.warning("upsert_position missing number, skipped: %s", str(position)[:80])
+                continue
+            position_number = str(position.get("position_number") or position.get("task_id"))
+            positions.append((position_number, statement))
+            values = self._company_values(company)
+            if values is not None:
+                companies.setdefault(str(values[0]), values)
+        if not positions:
+            return
+        positions.sort(key=lambda item: item[0])
+        company_rows = [companies[key] for key in sorted(companies)]
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                for _, (sql, values) in positions:
+                    await conn.execute(sql, *values)
+                for values in company_rows:
+                    await conn.execute(
+                        "INSERT INTO companies (company_number, company_name, company_size, financing_stage, industry_name, description) "
+                        "VALUES ($1,$2,$3,$4,$5,$6) "
+                        "ON CONFLICT(company_number) DO UPDATE SET "
+                        "company_name=EXCLUDED.company_name, company_size=EXCLUDED.company_size, "
+                        "financing_stage=EXCLUDED.financing_stage, industry_name=EXCLUDED.industry_name, "
+                        "description=EXCLUDED.description, fetched_at=now()",
+                        *values)
 
     async def upsert_company_mini(self, company_number: str, company_name: str) -> None:
         """只写公司号+名 (搜索 worker 先落库, 供 company: 任务消费时查名)。

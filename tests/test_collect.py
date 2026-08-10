@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from collect import (
-    RAW_JSON_MAX, WorkerConfig, _consume, _consume_position_loop,
+    DetailWriteBatcher, RAW_JSON_MAX, WorkerConfig, _consume, _consume_position_loop,
     _progress_monitor, _split_csv, _trim_raw_json,
 )
 from utils.async_client import AsyncZhilianClient, PositionUnavailableError
@@ -73,6 +73,23 @@ def test_async_client_exposes_connection_pool_size():
         assert client.max_clients == 37
         assert session.call_args.kwargs["max_clients"] == 37
         client.session.close = AsyncMock()
+
+
+def test_detail_write_batcher_flushes_and_closes():
+    async def _():
+        storage = SimpleNamespace(upsert_position_and_company_batch=AsyncMock())
+        batcher = DetailWriteBatcher(storage, batch_size=2, writers=1, max_pending=2)
+        await batcher.start()
+        await asyncio.gather(*(batcher.submit(
+            {"position_number": str(i)}, {"company_number": str(i)})
+            for i in range(3)))
+        await batcher.close()
+        assert storage.upsert_position_and_company_batch.await_count == 2
+        written = [call.args[0] for call in
+                   storage.upsert_position_and_company_batch.await_args_list]
+        assert sum(len(rows) for rows in written) == 3
+
+    asyncio.run(_())
 
 
 def test_worker_process_failure_propagates():

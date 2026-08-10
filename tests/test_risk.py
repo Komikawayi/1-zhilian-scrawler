@@ -139,6 +139,25 @@ def test_async_redis_risk_is_shared():
     asyncio.run(_())
 
 
+def test_async_redis_risk_precheck_is_single_round_trip():
+    async def _():
+        redis = aioredis.from_url("redis://127.0.0.1:6379/15",
+                                  decode_responses=True)
+        scope = "test-" + uuid.uuid4().hex
+        risk = AsyncRedisRiskState(redis, scope=scope)
+        try:
+            try:
+                await redis.ping()
+            except Exception:
+                pytest.skip("Redis unavailable")
+            await risk.async_await_cooldown()
+            assert await redis.hget(risk.key, "state") == STATE_OK
+        finally:
+            await redis.delete(risk.key)
+            await redis.aclose()
+    asyncio.run(_())
+
+
 def test_async_redis_risk_uses_server_time():
     """冷却截止时间不能受 worker 本机时钟偏差影响。"""
     async def _():

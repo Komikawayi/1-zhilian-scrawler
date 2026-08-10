@@ -59,48 +59,56 @@ class AsyncRateLimiter:
 
 
 class RedisRateLimiter:
-    """跨进程全局限速 (Redis 滑动窗口, Lua 原子)。避免固定窗口边界 2x 突发。
-
-    窗口 = 1s, 容量 = rate_per_sec。ZSET 记录时间戳, 过期成员自动清理。
-    """
+    """跨进程全局匀速限速器（Redis Lua 原子分配请求时隙）。"""
 
     _LUA = """
 local key = KEYS[1]
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
-local window_ms = tonumber(ARGV[1])
-local limit = tonumber(ARGV[2])
-redis.call('ZREMRANGEBYSCORE', key, 0, now - window_ms)
-local count = redis.call('ZCARD', key)
-if count < limit then
-  local seq = redis.call('INCR', key .. ':seq')
-  redis.call('ZADD', key, now, now .. '-' .. seq)
-  redis.call('EXPIRE', key, math.ceil(window_ms / 1000))
-  redis.call('EXPIRE', key .. ':seq', math.ceil(window_ms / 1000))
-  return 0
+local rate = tonumber(ARGV[1])
+local interval_ms = 1000 / rate
+local next_at = tonumber(redis.call('GET', key .. ':next_at') or now)
+if next_at < now then
+  next_at = now
 end
-local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
-if #oldest == 0 then
-  return 1
-end
-return math.max(1, tonumber(oldest[2]) + window_ms - now)
+local wait_ms = next_at - now
+local following = next_at + interval_ms
+redis.call('SET', key .. ':next_at', following,
+           'PX', math.max(2000, math.ceil(following - now + 1000)))
+redis.call('INCR', key .. ':issued')
+return math.floor(wait_ms)
 """
 
     def __init__(self, redis, rate_per_sec: float, key: str = "zhaopin:ratelimit:sw"):
         self.redis = redis
         self.rate = max(rate_per_sec, 0.0)
         self.key = key
+        self._pending_responses = 0
 
     async def acquire(self) -> None:
         if self.rate <= 0:
             return
-        window_ms = 1000
-        while True:
-            wait_ms = await self.redis.eval(self._LUA, 1, self.key,
-                                            window_ms, self.rate)
-            if wait_ms == 0:
-                return
+        wait_ms = int(await self.redis.eval(self._LUA, 1, self.key, self.rate))
+        if wait_ms > 0:
             await asyncio.sleep(wait_ms / 1000)
+
+    async def record_response(self) -> None:
+        """Record a completed HTTP response for global throughput monitoring."""
+        self._pending_responses += 1
+        if self._pending_responses >= 32:
+            await self.flush_response_metrics()
+
+    async def flush_response_metrics(self) -> None:
+        pending = self._pending_responses
+        self._pending_responses = 0
+        if pending:
+            await self.redis.incrby(self.key + ":responded", pending)
+
+    async def request_counts(self) -> tuple[int, int]:
+        await self.flush_response_metrics()
+        issued, responded = await self.redis.mget(
+            self.key + ":issued", self.key + ":responded")
+        return int(issued or 0), int(responded or 0)
 
 
 class AsyncZhilianClient:
@@ -140,17 +148,20 @@ class AsyncZhilianClient:
         """统一入口: 冷却阻塞 → 限速 → 请求 → 重试。"""
         if self.risk is not None:
             t0 = time.perf_counter()
-            await self.risk.async_await_cooldown()
+            waited = await self.risk.async_await_cooldown()
             if self.stats is not None:
-                dt = time.perf_counter() - t0
-                if dt > 0.01:   # 忽略正常无冷却; 仅记录实际触发冷却的等待 (>10ms)
-                    self.stats.record("cooldown", dt)
+                self.stats.record("risk_check", time.perf_counter() - t0 - waited)
+                if waited > 0:
+                    self.stats.record("cooldown", waited)
         if self.rate_limiter is not None:
             await self.rate_limiter.acquire()
         last_err: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
             try:
                 resp = await getattr(self.session, method)(url, timeout=self.timeout, **kw)
+                record_response = getattr(self.rate_limiter, "record_response", None)
+                if record_response is not None:
+                    await record_response()
                 if self.stats is not None and self.name:
                     infos = getattr(resp, "infos", None) or {}
                     self.stats.record_net(self.name,
@@ -178,6 +189,9 @@ class AsyncZhilianClient:
             await self.risk.async_on_captcha()
 
     async def close(self) -> None:
+        flush = getattr(self.rate_limiter, "flush_response_metrics", None)
+        if flush is not None:
+            await flush()
         await self.session.close()
 
 

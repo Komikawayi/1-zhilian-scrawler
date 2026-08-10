@@ -248,6 +248,30 @@ redis.call('HSET', KEYS[1], 'state', 'ok', 'challenge_streak', 0)
 return 'ok'
 """
 
+    _AWAIT_LUA = """
+local state = redis.call('HGET', KEYS[1], 'state')
+if not state then
+  redis.call('HSET', KEYS[1],
+             'state', 'ok',
+             'challenge_streak', 0,
+             'captcha_count', 0,
+             'cooling_until', 0,
+             'cooldown_sec', 0)
+  return 0
+end
+if state ~= 'cooling' then
+  return state
+end
+local cooling_until = tonumber(redis.call('HGET', KEYS[1], 'cooling_until') or '0')
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
+if cooling_until <= now then
+  redis.call('HSET', KEYS[1], 'state', 'ok', 'challenge_streak', 0)
+  return 'ok'
+end
+return math.ceil((cooling_until - now) * 1000)
+"""
+
     def __init__(self, redis, scope: str = "default") -> None:
         self.redis = redis
         self.key = f"zhaopin:risk:{scope}"
@@ -266,17 +290,23 @@ return 'ok'
         self.state = values.get("state", STATE_OK)
         return values
 
-    async def async_await_cooldown(self) -> None:
+    async def async_await_cooldown(self) -> float:
+        """Wait for shared cooldown and return the actual wait duration."""
+        waited = 0.0
         while True:
-            values = await self._refresh()
-            until = float(values.get("cooling_until", 0) or 0)
-            clock = await self.redis.time()
-            server_now = float(clock[0]) + float(clock[1]) / 1000000
-            sec = until - server_now
-            if values.get("state") != STATE_COOLING or sec <= 0:
-                return
-            logger.info("共享风控冷却中, 等待 %d 秒", int(sec))
-            await asyncio.sleep(min(sec, 5.0))
+            result = await self.redis.eval(self._AWAIT_LUA, 1, self.key)
+            if not isinstance(result, int):
+                self.state = result or STATE_OK
+                return waited
+            if result <= 0:
+                self.state = STATE_OK
+                return waited
+            self.state = STATE_COOLING
+            sec = result / 1000
+            logger.info("Shared risk cooldown; waiting %d seconds", int(sec))
+            delay = min(sec, 5.0)
+            await asyncio.sleep(delay)
+            waited += delay
 
     async def async_on_success(self) -> None:
         self.state = await self.redis.eval(self._SUCCESS_LUA, 1, self.key)

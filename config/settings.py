@@ -54,7 +54,7 @@ def _load_db_url() -> str:
 
 
 DB_URL = _load_db_url()          # PostgreSQL 连接串 (asyncpg)
-DB_POOL_MAX = 20                 # 连接池上限 (多 worker 并发写)
+DB_POOL_MAX = 30                 # 连接池上限 (多 worker 并发写; 两 worker 共 60)
 
 # ---- Redis 分布式任务队列 (Phase B: 万级, 隔离部署) ----
 REDIS_URL = "redis://127.0.0.1:6379/0"   # 隔离的 zhilian-redis 容器 (zhilian-net, 仅本机)

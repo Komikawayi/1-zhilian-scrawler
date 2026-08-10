@@ -72,7 +72,7 @@ Redis 承担三件事：**调度**（搜索/详情双队列）+ **按出口身�
         ▼
 详情队列  zhaopin:tasks:position  (LIST, 详情桶 400/s, N worker)
   position:CC883210900Jxxx        ← 全部岗位详情任务 (去重)
-        │  detailv2 → upsert positions + companies
+        │  detailv2 → 有界批量事务 → positions + companies
         ▼
 PostgreSQL
 ```
@@ -99,7 +99,7 @@ PostgreSQL
 - `seen` SET 去重 → 跨 producer 幂等
 - 类型前缀（`keyword:`/`company:`/`position:`）区分任务类型，同一套键结构照搬
 
-**限速（分桶）**：`RedisRateLimiter` 使用 Redis 服务器时间的滑动窗口 Lua。key 按 `ZHAOPIN_EGRESS_ID` 区分出口，再分 search/detail；不同出口不会错误共享同一总桶。
+**限速（分桶）**：`RedisRateLimiter` 使用 Redis 服务器时间的 Lua 时隙调度，以固定间隔分配请求。key 按 `ZHAOPIN_EGRESS_ID` 区分出口，再分 search/detail；不同出口不会错误共享同一总桶。每个桶同时维护 `issued` 和 `responded` 计数，分别表示已发出请求和已收到 HTTP 响应。
 
 ## 5. 阶段衔接
 
@@ -114,6 +114,8 @@ PostgreSQL
 ## 6. 速率与风控纪律
 
 - **搜索/详情分桶**：当前目标搜索 100/s、详情 400/s；这是配置目标，不表述为服务端硬上限
+- **详情批量持久化**：每个 worker 共享有界 `DetailWriteBatcher`，按 20 条或 20ms 聚合，以两个 PostgreSQL writer 事务写入。岗位先按岗位号排序，再按公司号去重排序更新，避免多 writer 在 `ON CONFLICT DO UPDATE` 时形成反向行锁；仅当批量事务成功后才确认 Redis 任务。
+- **端到端实测**：搜索新关键词在 20 秒稳态窗口为 100.45 个有效响应/s。详情 25 万真实任务池的约两分钟样本为 45,632 个 HTTP 响应和 45,633 个持久化完成，约 352 条/s；400/s 保持为桶的上限配置。
 - **连接池显式跟随并发**：不会再被 curl_cffi 默认 `max_clients=10` 静默截断
 - **Redis 连接池显式跟随 worker 并发**：每个 worker 的连接池上限按 `search_concurrency + concurrency + 32` 计算（400/100 配置对应 532），避免 redis-py 默认上限导致 `MaxConnectionsError`
 - **Windows 运行时边界**：curl_cffi 的 asyncio selector 使用 `select()`，本机池 600 以上会先触发文件描述符限制；这是客户端约束，不是服务端上限

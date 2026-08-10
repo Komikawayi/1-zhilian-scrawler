@@ -70,7 +70,8 @@ class Pipeline:
         """执行流水线, 返回统计。"""
         self.started = time.time()
         from config import settings as _settings
-        self.storage = await AsyncStorage.create(self.cfg.db_url or _settings.DB_URL)
+        self.storage = await AsyncStorage.create(
+            self.cfg.db_url or _settings.DB_URL, pool_max=_settings.DB_POOL_MAX)
         if self.cfg.resume:
             existing = await self.storage.get_existing_numbers()
             self._seen = existing
@@ -171,12 +172,10 @@ class Pipeline:
                 row["raw_json"] = json.dumps(data, ensure_ascii=False)[:8000]
                 await client.report_success()
                 t0 = time.perf_counter()
-                await self.storage.upsert_position(row)
                 comp = {k: row.get(k, "") for k in
                         ("company_number", "company_name", "company_size",
                          "financing_stage", "industry_name")}
-                if comp.get("company_number"):
-                    await self.storage.upsert_company(comp)
+                await self.storage.upsert_position_and_company(row, comp)
                 self.stats.record("db_detail", time.perf_counter() - t0)
                 self.success += 1
             except Exception as e:  # noqa: BLE001

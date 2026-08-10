@@ -80,6 +80,67 @@ logger = logging.getLogger("collect")
 IDLE_EXIT_SEC = 600
 
 
+class DetailWriteBatcher:
+    """详情结果的有界批量写入器；每个 worker 共享，成功后才释放提交方。"""
+
+    def __init__(self, storage, batch_size: int = 20, writers: int = 2,
+                 max_pending: int = 200) -> None:
+        self.storage = storage
+        self.batch_size = max(1, batch_size)
+        self.writers = max(1, writers)
+        self._pending = asyncio.Queue(maxsize=max(self.batch_size, max_pending))
+        self._tasks: list[asyncio.Task] = []
+        self._sentinel = object()
+
+    async def start(self) -> None:
+        if self._tasks:
+            return
+        self._tasks = [asyncio.create_task(self._writer()) for _ in range(self.writers)]
+
+    async def submit(self, position: dict, company: dict) -> None:
+        loop = asyncio.get_running_loop()
+        result = loop.create_future()
+        await self._pending.put((position, company, result))
+        await result
+
+    async def _writer(self) -> None:
+        while True:
+            item = await self._pending.get()
+            if item is self._sentinel:
+                self._pending.task_done()
+                return
+            batch = [item]
+            try:
+                while len(batch) < self.batch_size:
+                    try:
+                        batch.append(await asyncio.wait_for(
+                            self._pending.get(), timeout=0.02))
+                    except asyncio.TimeoutError:
+                        break
+                rows = [(position, company) for position, company, _ in batch]
+                await self.storage.upsert_position_and_company_batch(rows)
+            except Exception as exc:  # noqa: BLE001
+                for _, _, result in batch:
+                    if not result.done():
+                        result.set_exception(exc)
+            else:
+                for _, _, result in batch:
+                    if not result.done():
+                        result.set_result(None)
+            finally:
+                for _ in batch:
+                    self._pending.task_done()
+
+    async def close(self) -> None:
+        if not self._tasks:
+            return
+        await self._pending.join()
+        for _ in self._tasks:
+            await self._pending.put(self._sentinel)
+        await asyncio.gather(*self._tasks)
+        self._tasks.clear()
+
+
 def _split_csv(value: str) -> list[str]:
     """按中英文逗号拆分 CLI/向导输入，避免全角标点被当作内容。"""
     return [item.strip() for item in value.replace("，", ",").split(",") if item.strip()]
@@ -372,7 +433,8 @@ async def _consume_search_loop(queue, client, storage, pos_queue,
 # ---- 详情任务消费 (position:) ----
 
 async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
-                                 search_q=None, stats: LatencyStats = None) -> Dict:
+                                 search_q=None, stats: LatencyStats = None,
+                                 write_batcher: DetailWriteBatcher = None) -> Dict:
     """详情队列消费协程: position:任务 → detailv2 → upsert PG。
 
     退出条件 (防假早退): 详情队列空**且**搜索池整体静默 (搜索队列空 + 无在途
@@ -407,12 +469,13 @@ async def _consume_position_loop(queue, client, storage, cfg: WorkerConfig,
             row["source"] = "detailv2"
             row["raw_json"] = _trim_raw_json(data)   # 截断长字段后整体序列化 (保证合法 JSON)
             t0 = time.perf_counter()
-            await storage.upsert_position(row)
             comp = {k: row.get(k, "") for k in
                     ("company_number", "company_name", "company_size",
                      "financing_stage", "industry_name")}
-            if comp.get("company_number"):
-                await storage.upsert_company(comp)
+            if write_batcher is None:
+                await storage.upsert_position_and_company(row, comp)
+            else:
+                await write_batcher.submit(row, comp)
             if stats is not None:
                 stats.record("db_detail", time.perf_counter() - t0)
             await queue.complete(task_id)
@@ -613,7 +676,9 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
     detail_client = AsyncZhilianClient(risk=risk, rate_limiter=detail_limiter,
                                        stats=stats, name="detail",
                                        max_clients=max(1, cfg.concurrency))
-    storage = await AsyncStorage.create(cfg.db_url)
+    storage = await AsyncStorage.create(cfg.db_url, pool_max=settings.DB_POOL_MAX)
+    write_batcher = DetailWriteBatcher(storage)
+    await write_batcher.start()
     # watchdog 独立 Task: 消费 loop 全退后 cancel, 否则 gather 永不返回 (流程不收敛)
     watchdog = asyncio.create_task(_watchdog(search_q, pos_q))
     monitor = asyncio.create_task(_progress_monitor(search_q, pos_q, cfg,
@@ -624,7 +689,8 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
     ]
     coros += [
         _consume_position_loop(pos_q, detail_client, storage, cfg,
-                               search_q=search_q, stats=stats)
+                               search_q=search_q, stats=stats,
+                               write_batcher=write_batcher)
         for _ in range(cfg.concurrency)
     ]
     try:
@@ -638,6 +704,7 @@ async def _worker_loop(cfg: WorkerConfig) -> Dict:
         await asyncio.gather(watchdog, monitor, return_exceptions=True)
         await search_client.close()
         await detail_client.close()
+        await write_batcher.close()
         await storage.close()
         await search_q.close()
         await pos_q.close()

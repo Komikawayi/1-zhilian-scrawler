@@ -35,13 +35,13 @@ _STAGE_ORDER = [
     "search_net", "detail_net",          # 网络 (总耗时 + TTFB 附加列)
     "search_parse", "detail_parse",      # 本地解析
     "db_detail", "db_search",            # 本地入库
-    "cooldown",                          # 风控冷却等待
+    "risk_check", "cooldown",            # 风控冷却等待
 ]
 _STAGE_LABEL = {
     "search_net": "搜索网络", "detail_net": "详情网络",
     "search_parse": "搜索解析", "detail_parse": "详情解析",
     "db_detail": "详情入库", "db_search": "搜索入库",
-    "cooldown": "冷却等待",
+    "risk_check": "risk precheck", "cooldown": "冷却等待",
 }
 
 

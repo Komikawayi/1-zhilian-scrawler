@@ -82,7 +82,27 @@ def test_redis_rate_limiter_shared_and_precise_wait():
             return time.perf_counter() - start
         finally:
             if connected:
-                await redis.delete(key, key + ":seq")
+                await redis.delete(key, key + ":next_at", key + ":issued", key + ":responded")
             await redis.aclose()
     elapsed = asyncio.run(_())
     assert 0.8 < elapsed < 2.5
+
+
+def test_redis_rate_limiter_records_issued_and_responded():
+    async def _():
+        redis = aioredis.from_url("redis://127.0.0.1:6379/15",
+                                  decode_responses=True)
+        key = "zhaopin:test:metrics:" + uuid.uuid4().hex
+        try:
+            try:
+                await redis.ping()
+            except Exception:
+                pytest.skip("Redis unavailable")
+            limiter = RedisRateLimiter(redis, 10, key=key)
+            await limiter.acquire()
+            await limiter.record_response()
+            return await limiter.request_counts()
+        finally:
+            await redis.delete(key, key + ":seq", key + ":issued", key + ":responded")
+            await redis.aclose()
+    assert asyncio.run(_()) == (1, 1)

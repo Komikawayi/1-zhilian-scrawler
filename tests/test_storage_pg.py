@@ -89,6 +89,45 @@ def test_upsert_position_dedup():
     _run(_())
 
 
+def test_upsert_position_and_company_is_atomic():
+    _ensure_test_db()
+    url = _base_url()
+    _clear_tables(url)
+
+    async def _():
+        s = await AsyncStorage.create(url)
+        try:
+            await s.upsert_position_and_company(
+                {"position_number": "TEST2", "position_name": "role", "raw_json": {"a": 1}},
+                {"company_number": "COM2", "company_name": "company"})
+            assert await s.count("positions") == 1
+            assert await s.count("companies") == 1
+        finally:
+            await s.close()
+    _run(_())
+
+
+def test_upsert_position_and_company_batch():
+    _ensure_test_db()
+    url = _base_url()
+    _clear_tables(url)
+
+    async def _():
+        s = await AsyncStorage.create(url)
+        try:
+            rows = [
+                ({"position_number": f"TESTB{i}", "raw_json": {"i": i}},
+                 {"company_number": f"COMB{i}", "company_name": "company"})
+                for i in range(3)
+            ]
+            await s.upsert_position_and_company_batch(rows)
+            assert await s.count("positions") == 3
+            assert await s.count("companies") == 3
+        finally:
+            await s.close()
+    _run(_())
+
+
 def test_runs_and_export(tmp_path):
     _ensure_test_db()
     url = _base_url()
