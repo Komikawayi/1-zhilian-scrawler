@@ -495,28 +495,30 @@ async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig, risk=None,
         # Unix/Git Bash/PyCharm Terminal 带 TERM; Windows conhost 尝试启用 VT → 4 行覆盖
         term = os.environ.get("TERM") or ""
         use_ansi = (bool(term) and term != "dumb") or _enable_windows_vt()
-    prev_s_done = prev_d_done = None       # 上次刷新 done (滚动, 算速率)
-    base_s_done = base_d_done = None       # 本次运行基线 (增量起点)
-    base_s_fail = base_d_fail = 0
-    prev_t = time.time()
-    started = time.time()
+    # 启动时立即记录基线；旧实现首个 1s tick 只记录基线不输出，导致首屏延迟约 2s，
+    # 且启动后第一秒完成量会被误当作历史数据扣除。
+    initial_s, initial_p = await asyncio.gather(search_q.stats(), pos_q.stats())
+    base_s_done, base_d_done = initial_s["done"], initial_p["done"]
+    base_s_fail, base_d_fail = initial_s["failed"], initial_p["failed"]
+    prev_s_done, prev_d_done = base_s_done, base_d_done
+    loop = asyncio.get_running_loop()
+    prev_t = started = loop.time()
+    next_tick = started + interval
     printed = False
     try:
         while True:
-            await asyncio.sleep(interval)
-            ss = await search_q.stats()
-            ps = await pos_q.stats()
-            # 最近消费明细 (各 worker 写入的 Redis key)
-            last_s = await search_q.redis.get("zhaopin:last_consume:search") or ""
-            last_d = await search_q.redis.get("zhaopin:last_consume:detail") or ""
-            now = time.time()
-            # 首循环: 记录本次运行基线 (Redis done/failed 是历史累积, 增量=当前-基线)
-            if base_s_done is None:
-                base_s_done, base_d_done = ss["done"], ps["done"]
-                base_s_fail, base_d_fail = ss["failed"], ps["failed"]
-                prev_s_done, prev_d_done = base_s_done, base_d_done
-                prev_t = now
-                continue
+            await asyncio.sleep(max(0.0, next_tick - loop.time()))
+            ss, ps, last_s, last_d = await asyncio.gather(
+                search_q.stats(),
+                pos_q.stats(),
+                search_q.redis.get("zhaopin:last_consume:search"),
+                search_q.redis.get("zhaopin:last_consume:detail"),
+            )
+            last_s, last_d = last_s or "", last_d or ""
+            now = loop.time()
+            next_tick += interval
+            if next_tick <= now:
+                next_tick = now + interval
             dt = now - prev_t
             s_done = ss["done"] - base_s_done     # 本次运行累计完成 (不含历史)
             d_done = ps["done"] - base_d_done

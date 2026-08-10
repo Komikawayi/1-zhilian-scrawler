@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from collect import (
-    RAW_JSON_MAX, WorkerConfig, _consume, _consume_position_loop, _split_csv,
-    _trim_raw_json,
+    RAW_JSON_MAX, WorkerConfig, _consume, _consume_position_loop,
+    _progress_monitor, _split_csv, _trim_raw_json,
 )
 from utils.async_client import AsyncZhilianClient, PositionUnavailableError
 
@@ -38,6 +38,32 @@ def test_trim_raw_json_short_untouched():
 
 def test_split_csv_accepts_fullwidth_comma():
     assert _split_csv("smt，pcba, 贴片") == ["smt", "pcba", "贴片"]
+
+
+def test_progress_monitor_prints_on_first_tick():
+    """首个刷新周期必须输出，不能把第一个 tick 仅用于记录基线。"""
+    async def _():
+        queue = AsyncMock()
+        queue.stats.return_value = {
+            "queue": 0, "processing": 0, "seen": 0, "done": 0, "failed": 0,
+        }
+        queue.redis.get.return_value = ""
+        sleeps = 0
+
+        async def fake_sleep(_delay):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 2:
+                raise asyncio.CancelledError
+
+        cfg = WorkerConfig(redis_url="redis://test", db_url="postgresql://test")
+        with patch("collect.asyncio.sleep", side_effect=fake_sleep), \
+             patch("builtins.print") as output:
+            await _progress_monitor(queue, queue, cfg, interval=1.0)
+        assert any("[运行]" in str(call.args[0]) for call in output.call_args_list
+                   if call.args)
+
+    asyncio.run(_())
 
 
 def test_async_client_exposes_connection_pool_size():
