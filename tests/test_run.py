@@ -2,6 +2,14 @@
 from unittest.mock import patch
 
 import run
+from config import settings
+
+
+def test_runtime_defaults_match_requested_targets():
+    assert run.DEFAULT_SEARCH_CONCURRENCY == settings.SEARCH_CONCURRENCY == 100
+    assert run.DEFAULT_CONCURRENCY == settings.DETAIL_CONCURRENCY == 400
+    assert run.DEFAULT_SEARCH_RATE == settings.SEARCH_RATE_PER_SEC == 100.0
+    assert run.DEFAULT_RATE == settings.DETAIL_RATE_PER_SEC == 400.0
 
 
 def test_redis_runner_forwards_split_limits():

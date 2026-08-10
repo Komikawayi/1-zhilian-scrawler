@@ -85,6 +85,7 @@ async def _run_stage(concurrency: int, duration: float, city: str, kw: str,
                     fail += 1
             except Exception as e:  # noqa: BLE001
                 fail += 1
+                stop.set()
                 if fail <= 3:
                     print(f"  [err] {type(e).__name__}: {str(e)[:140]}", flush=True)
             # 每请求后固定节流: 请求本身已串行, 间隔 = 1/期望速率;

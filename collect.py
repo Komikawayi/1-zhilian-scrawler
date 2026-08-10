@@ -11,14 +11,14 @@
                 position:任务 → position-detailv2 → upsert PostgreSQL
   --stats     队列统计
 
-搜索/详情各自独立 Redis 滑动窗口限速桶 (默认 搜索 20/s + 详情 80/s,
-搜索风控敏感保持低频, 详情无 IP 信誉依赖可高频);
+搜索/详情各自独立 Redis 滑动窗口限速桶 (默认 搜索 100/s + 详情 400/s,
+搜索仍受共享风控状态和限速桶约束, 详情无 IP 信誉依赖可高频);
 风控状态机通过 Redis 按出口身份跨 worker/run 共享 (utils/risk.py)。
 
 用法:
   py collect.py --produce --kw smt,pcba --cities 653,530        # 建搜索任务池 (自动翻完所有页)
   py collect.py --produce --companies CZ883210900,CZ1425835260            # 公司名补采任务
-  py collect.py --consume --workers 4 --concurrency 10 --search-rate 20 --detail-rate 80  # 多进程消费
+  py collect.py --consume --workers 2 --concurrency 400 --search-concurrency 100 --search-rate 100 --detail-rate 400  # 多进程消费
   py collect.py --stats                                                   # 队列进度
 """
 from __future__ import annotations
@@ -136,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--concurrency", type=int, default=settings.DETAIL_CONCURRENCY,
                     help="详情并发协程数/worker")
     ap.add_argument("--search-concurrency", type=int, default=settings.SEARCH_CONCURRENCY,
-                    help="搜索并发协程数/worker (搜索桶 20/s 需全局 ≥12; 默认 10)")
+                    help="搜索并发协程数/worker (默认 100)")
     ap.add_argument("--rate", type=float, default=settings.DETAIL_RATE_PER_SEC,
                     help="[兼容] 全局旧限速; 用 --search-rate/--detail-rate 分桶")
     ap.add_argument("--search-rate", type=float, default=settings.SEARCH_RATE_PER_SEC,
@@ -197,10 +197,10 @@ async def _produce(args) -> int:
 class WorkerConfig:
     redis_url: str
     db_url: str
-    concurrency: int = 10
-    search_concurrency: int = 10       # 每 worker 搜索协程数 (够打满 20/s 搜索桶)
-    search_rate: float = 20.0        # 搜索桶限速 (IP 信誉敏感)
-    detail_rate: float = 80.0        # 详情桶保守生产值
+    concurrency: int = settings.DETAIL_CONCURRENCY
+    search_concurrency: int = settings.SEARCH_CONCURRENCY
+    search_rate: float = settings.SEARCH_RATE_PER_SEC
+    detail_rate: float = settings.DETAIL_RATE_PER_SEC
     max_attempts: int = 3
     worker_id: int = 0
 
@@ -584,7 +584,7 @@ async def _progress_monitor(search_q, pos_q, cfg: WorkerConfig, risk=None,
 async def _worker_loop(cfg: WorkerConfig) -> Dict:
     """单个 worker 进程: 搜索消费 + 详情消费 + 崩溃 watchdog + 实时进度。
 
-    搜索/详情分桶限速: 搜索用 search 桶 (低频, IP 信誉敏感), 详情用 detail 桶
+    搜索/详情分桶限速: 搜索用 search 桶 (IP 信誉敏感), 详情用 detail 桶
     (高频, 实测无风控)。两个 client 各持自己的 rate_limiter。
     """
     search_q = TaskQueue(cfg.redis_url, queue_type=QUEUE_SEARCH)

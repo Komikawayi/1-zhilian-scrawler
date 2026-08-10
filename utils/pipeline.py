@@ -2,10 +2,10 @@
 """
 单机异步流水线 — 搜索生产者 + 详情消费者 + PostgreSQL 入库
 
-Phase A 核心: 详情并发 (默认 10, 无 IP 信誉依赖), 搜索低频 (风控敏感)。
+Phase A 核心: 详情并发 (默认 400, 无 IP 信誉依赖), 搜索并发 (默认 100, 风控敏感)。
 
 链路:
-  搜索 SSR (低频, ≤search_concurrency) → 唯一 number → asyncio.Queue(有界, 背压)
+  搜索 SSR (受 search rate 桶控制, ≤search_concurrency) → 唯一 number → asyncio.Queue(有界, 背压)
     → 详情并发拉取 (detail_concurrency) → upsert PostgreSQL (positions/companies)
 
 特性:
@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List
 
+from config import settings
 from utils.async_client import (
     AsyncRateLimiter, AsyncZhilianClient, fetch_position_detail_v2_async,
 )
@@ -39,10 +40,10 @@ class PipelineConfig:
     keywords: List[str]
     city: str
     pages: int = 5
-    detail_concurrency: int = 10
-    search_concurrency: int = 2
+    detail_concurrency: int = settings.DETAIL_CONCURRENCY
+    search_concurrency: int = settings.SEARCH_CONCURRENCY
     queue_size: int = 200
-    detail_rate_per_sec: float = 8.0
+    detail_rate_per_sec: float = settings.DETAIL_RATE_PER_SEC
     db_url: str = ""          # PostgreSQL URL (asyncpg); 空则用 settings.DB_URL
     resume: bool = False
     name: str = ""
@@ -115,7 +116,7 @@ class Pipeline:
     # ---- 搜索生产者 ----
 
     async def _search_worker(self, client: AsyncZhilianClient, kw: str) -> None:
-        """低频搜索: SSR 提取唯一 number 入队。"""
+        """受风控桶控制的搜索: SSR 提取唯一 number 入队。"""
         for page in range(1, self.cfg.pages + 1):
             try:
                 html = await self._search_page(client, kw, self.cfg.city, page)

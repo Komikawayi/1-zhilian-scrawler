@@ -2,7 +2,7 @@
 
 智联招聘逆向爬虫：搜索 SSR + 职位详情**纯协议**采集。
 核心成果是完整破解腾讯 EdgeOne 职位详情页 **JS Challenge**（91-opcode 字节码 VM 本地执行算
-`EO-Bot-Js-Token`），并摸清 TCaptcha TDC 兜底验证码链（`cap_union_prehandle` / `tdc.js` / POW）。
+`EO-Bot-Js-Token`），并完成 TCaptcha TDC 兜底验证码链分析（`cap_union_prehandle` / `tdc.js` / POW）。
 
 详情页挑战求解需 Node.js；采集全流程不依赖浏览器。侦察素材在 `js_reverse_cache/`，深度分析见
 `docs/zhilian-edgeone-reverse-analysis.md`。
@@ -16,7 +16,7 @@
 | ① 搜索访问门控 | EdgeOne TLS/HTTP2 指纹 (JA3/JA4) | ✅ 已破（`curl_cffi impersonate=chrome`）|
 | ② 详情页主防线 | `EO-Bot-Js-Token`（91-opcode VM，29KB 挑战壳）| ✅ 已破（Node vm 求解，无需解混淆）|
 | ②' 详情数据 | **`position-detailv2` JSON API（纯协议无挑战）** | ✅ **默认路径**（匿名 448/448 压测零升级）|
-| ③ 详情页兜底 | TCaptcha TDC（`cap_union_prehandle`/`tdc.js`/`new_verify`）| 🔬 **链路+边界已摸清并封存**：协议链路/POW/真实请求体已还原（见 `tasks/zhilian-detail-tdc-002/`），但 verify 需真实浏览器 collect，且 ticket 绑定浏览器指纹，纯协议无法解锁 |
+| ③ 详情页兜底 | TCaptcha TDC（`cap_union_prehandle`/`tdc.js`/`new_verify`）| 🔬 **链路与边界已确认并封存**：协议链路/POW/真实请求体已还原（见 `tasks/zhilian-detail-tdc-002/`），但 verify 需真实浏览器 collect，且 ticket 绑定浏览器指纹，纯协议无法解锁 |
 | ④ fe-api 动态参数 | `_v` / `x-zp-page-request-id` / `x-zp-client-id` | ✅ 非签名（随机/无参/真实参都 200）|
 
 ### 关键结论（实测）
@@ -39,12 +39,12 @@
   交互验证码（`Security Verification`）。curl_cffi Chrome 指纹信誉稳（高频 15 次/0.4s 也不升级）；
   requests 无指纹在信誉差时首跳直接交互验证码。被升级后冷却 5-30 分钟恢复。
 
-### 正确使用姿势
+### 主要使用入口
 
 ```
 一键采集:      py run.py              (交互向导 → Redis 分布式自动跑)
 手动分布式:    py collect.py --produce --kw <词> --cities <码>
-               py collect.py --consume --workers N --concurrency N --search-concurrency 10 --search-rate 20 --detail-rate 80
+               py collect.py --consume --workers N --concurrency 400 --search-concurrency 100 --search-rate 100 --detail-rate 400
 公司补采:      py collect.py --produce --companies <公司号,...>
 聚合分析:      py tools/company_aggregate.py --company <公司号>
 SSR 兜底:      py main.py --detail-urls 自动过 JS Challenge (LEGACY)
@@ -141,8 +141,8 @@ py run.py
 # 1. 生成任务池 (城市×关键词 笛卡尔积; keyword 任务消费时自动翻完所有页)
 py collect.py --produce --kw smt,pcba,贴片 --cities 653,530 --clear
 
-# 2. 多进程消费 (搜索 + 详情双队列, 各自独立限速桶: 搜索 20/s + 详情 80/s)
-py collect.py --consume --workers 4 --concurrency 10 --search-concurrency 10 --search-rate 20 --detail-rate 80
+# 2. 多进程消费 (搜索 + 详情双队列, 各自独立限速桶: 搜索 100/s + 详情 400/s)
+py collect.py --consume --workers 2 --concurrency 400 --search-concurrency 100 --search-rate 100 --detail-rate 400
 
 # 3. 队列进度
 py collect.py --stats
@@ -156,7 +156,7 @@ company_number，SSR pages 精确分页），岗位入详情队列 → 每个公
 
 ```powershell
 py collect.py --produce --companies CZ883210900,CZL1425835260
-py collect.py --consume --workers 2 --concurrency 8
+py collect.py --consume --workers 2 --concurrency 400 --search-concurrency 100 --search-rate 100 --detail-rate 400
 ```
 
 ### 公司聚合分析
@@ -192,9 +192,10 @@ py main.py --detail --detail-urls "https://www.zhaopin.com/jobdetail/CCL14801178
 
 - **连接池校正（2026-08-10）**：旧探针未设置 `max_clients`，被 curl_cffi 默认连接池 10 截断，不能据此认定服务端存在 `~70/s` 硬上限
 - **详情持续探针（2026-08-10）**：3 个实时有效岗位、池 40 持续 180 秒，**37,443 成功 / 78 次 211 / 0 其他异常，207.6 req/s**；池 80/120 的 60 秒档为 223.6/229.3 req/s，但 p95 从 585ms 升到 804ms，继续加并发收益很低
+- **最大并发阶梯（2026-08-10）**：搜索 200/300 并发持续 30 秒为 **173.5/174.6 req/s、0 失败**；400/500 并发降至 150.7/161.5 req/s 且 p95 约 4s。详情 5 个岗位、池 500 的 10 秒档为 **573.8 req/s、2 次 211、0 其他异常**；池 600/800 触发 Windows `select()` 文件描述符上限，属于客户端运行时限制，不是智联接口上限
 - **211 语义校正**：高并发下观察到有效岗位偶发 211 后恢复 200，生产改为最多 3 次队列重试，不再单次即永久丢弃
 - **分布式链路（2026-08-08）**：2 关键词页 → 31 家公司补采 → **1382 岗位 0 失败**；4 worker 压测 2282 岗位全 done；紫光未来 32/32 精确补采
-- **历史基准**：448 条顺序压测 100% 成功（0.54/s）；Phase B Redis 1705 条 100%（~114s）
+- **历史基准**：448 条顺序压测 100% 成功（0.54 req/s）；Phase B Redis 1705 条 100%（约 114s）。这些结果用于回归对照，不代表当前并发路径的吞吐上限
 
 > 登录态说明：采集**不依赖登录态**（匿名可用）。搜索 `positionCount` 恒显示 100 但实际可翻页远超 5 页（实测 p1-p8 全唯一，p=50 仍有数据）。
 
@@ -236,10 +237,10 @@ $env:ZHAOPIN_NETWORK_TEST=1; py -m pytest tests/ -v # PowerShell 含真实网络
 --pages <n>              仅 --single 单机模式生效 (每关键词页数; produce 自动翻页无上限)
 --workers <n>            消费 worker 进程数
 --concurrency <n>        详情并发协程数/worker (同时作为该 worker 的连接池下限)
---search-concurrency <n> 搜索并发协程数/worker (默认 10, 打满 20/s 桶)
+--search-concurrency <n> 搜索并发协程数/worker (默认 100)
 --rate <n>               [兼容] 全局旧限速 (搜索+详情同值; 优先用分桶参数)
---search-rate <n>        搜索桶限速 req/s (默认 20, 风控敏感)
---detail-rate <n>        详情桶限速 req/s (默认 80; 提高前需持续压测)
+--search-rate <n>        搜索桶限速 req/s (默认 100, 风控敏感)
+--detail-rate <n>        详情桶限速 req/s (默认 400)
 --clear                  produce 前清空对应队列
 --db <url>               PostgreSQL URL
 --redis <url>            Redis URL
@@ -265,7 +266,7 @@ docs/                       逆向分析文档 + 架构方案
 采集终端默认**只显示**错误/警告 + 4 行实时进度（每秒 ANSI 刷新）：
 
 ```
-[搜索] 排队   12 处理中   3 完成  412  失败  1 | 20.0/s    [详情] 排队   8 处理中  2 完成 1834 失败 0 | 80.0/s
+[搜索] 排队   12 处理中   3 完成  412  失败  1 | 100.0/s   [详情] 排队   8 处理中  2 完成 1834 失败 0 | 400.0/s
 [消费] 搜索:SMT工程师|杭州                    | 详情:工艺工程师|杭州
 [运行] 00:23:45   总完成 2246 总失败 1   综合 96.7/s   风控:ok
 [延迟] 搜索 449ms(TTFB 446) | 详情 211ms(TTFB 197) | 解析 1.2ms | 入库 1.8ms
@@ -324,12 +325,12 @@ docs/                       逆向分析文档 + 架构方案
 
 ## 限速与风控纪律
 
-- 搜索页 + `position-detailv2`（推荐详情路径）纯协议稳定，**不受详情页 IP 信誉影响**（20/20 实测）。
+- 搜索页 + `position-detailv2`（推荐详情路径）使用纯协议请求；生产路径由 Redis 分别控制搜索 100 req/s、详情 400 req/s。该配置是当前运行目标，不是服务端长期安全上限。
 - SSR 兜底路径：详情页 challenge 自动本地求解，token 可复用 1 小时；**IP 信誉是共享资源**，
   大量探测会升级到交互验证码（验证码放行绑定浏览器指纹，curl_cffi 无法复用），需冷却 5-30 分钟。
 - curl_cffi 0.16 在 HTTP/2 下 Set-Cookie 解析异常（`r.headers['set-cookie']` 只返回 `path=/`）；
   SSR 重放只需带 `EO-Bot-Js-Token`（首次重放 1.7MB 已验证），`acw_tc`/`cdn_sec_tc` 非必需。
-- 逐条采集建议 1-2 秒/请求（`--sleep 1.5` 默认），高并发易触发风控。
+- legacy SSR 或登录态接口仍采用低频节奏（默认 `--sleep 1.5`）；生产 Redis 路径使用独立并发和滑动窗口限速，不应将两种路径的请求节奏混为一谈。
 
 ## 风控状态机（utils/risk.py）
 
@@ -366,7 +367,7 @@ js_reverse_cache/analysis/probe/test_replay_cookie.py  requests vs curl_cffi 重
 js_reverse_cache/analysis/tdc/                         TDC 逆向 (iv8_*.py / extract_webpack_module / tdc_iv8_e2e)
 ```
 
-详细逆向过程、防线分级、TDC 协议链与踩坑记录：
+详细逆向过程、防线分级、TDC 协议链与问题记录：
 - `docs/zhilian-edgeone-reverse-analysis.md`
 - `js_reverse_cache/tasks/zhilian-detail-tdc-001/report.md`
 

@@ -92,6 +92,7 @@ async def _run_stage(concurrency: int, duration: float, numbers: list,
                                          curl_infos=[CurlInfo.STARTTRANSFER_TIME,
                                                      CurlInfo.TOTAL_TIME])
     ok = fail = died = err = 0
+    errors: dict[str, int] = {}
     lat: list[float] = []
     start = time.perf_counter()
     end = start + duration
@@ -113,14 +114,19 @@ async def _run_stage(concurrency: int, duration: float, numbers: list,
                     fail += 1
                 elif feat == "NONJSON":
                     err += 1
+                    errors[feat] = errors.get(feat, 0) + 1
                     fail += 1
                     stop.set()
                 else:
                     err += 1
+                    errors[feat] = errors.get(feat, 0) + 1
                     fail += 1
                     stop.set()
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 fail += 1
+                key = f"EXC:{type(e).__name__}"
+                errors[key] = errors.get(key, 0) + 1
+                stop.set()
             await asyncio.sleep(0.005)
 
     tasks = [asyncio.create_task(_worker()) for _ in range(concurrency)]
@@ -134,6 +140,7 @@ async def _run_stage(concurrency: int, duration: float, numbers: list,
         "max_clients": pool,
         "rps": ok / dur,
         "ok": ok, "fail": fail, "died": died, "err": err,
+        "errors": errors,
         "lat50": lat[n // 2] * 1000 if n else 0,
         "lat95": lat[int(n * 0.95)] * 1000 if n else 0,
     }
@@ -159,7 +166,7 @@ async def main() -> None:
           f"{'LAT50ms':>8} {'LAT95ms':>8} {'标记':>8}")
     for c in concs:
         r = await _run_stage(c, args.each, numbers, args.max_clients)
-        flag = "业务异常" if r["err"] > 0 else "-"
+        flag = ",".join(f"{k}:{v}" for k, v in r["errors"].items()) or "-"
         print(f"{r['concurrency']:>4} {r['max_clients']:>4} {r['ok']:>6} {r['fail']:>5} {r['died']:>6} "
               f"{r['rps']:>6.1f} {r['lat50']:>8.1f} {r['lat95']:>8.1f} {flag:>8}")
         if r["err"] > 0:

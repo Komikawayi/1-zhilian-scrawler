@@ -2,7 +2,7 @@
 """
 异步 HTTP 客户端 — curl_cffi AsyncSession + 全局令牌桶限速
 
-Phase A 高并发详情采集 (详情并发 10, 无 IP 信誉依赖)。
+Phase A 高并发详情采集 (详情并发默认 400, 无 IP 信誉依赖)。
 
 保持与 utils/http_client.py 相同的风控纪律:
   - impersonate=chrome (TLS 指纹)
