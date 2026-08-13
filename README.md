@@ -382,4 +382,3 @@ js_reverse_cache/analysis/tdc/                         TDC 逆向 (iv8_*.py / ex
   - `search/positions`（搜索 JSON API）返回 `isVerification:1` 需额外验证，SSR 已绕过
   - `associational-word`（联想词）、公司工商接口
 
-> 私有仓库：逆向算法代码不公开。如需公开请手动切换 GitHub repo visibility。
