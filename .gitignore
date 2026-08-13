@@ -16,14 +16,20 @@ output/
 # 敏感凭据 (登录会话等)
 config/*.local.json
 
-# 登录态捕获数据 (简历/设备指纹等)
-js_reverse_cache/network/resume_preview.json
-js_reverse_cache/**/shumei_smid.json
+# 本地侦察与会话捕获（不入库）
+js_reverse_cache/assets/html/
+js_reverse_cache/assets/network/
+js_reverse_cache/data/
+js_reverse_cache/network/
+js_reverse_cache/html/
+js_reverse_cache/search_base_data.json
+js_reverse_cache/**/state_snapshot.json
 js_reverse_cache/**/*smid*.json
 js_reverse_cache/**/*reportShuMei*.json
-
-# 侦察缓存: 保留 HTML/JS/网络样本 (artifact), 忽略敏感 cookie 快照
-js_reverse_cache/**/state_snapshot.json
+js_reverse_cache/**/dp_live_packets*.jsonl
+js_reverse_cache/**/network_packets.json
+js_reverse_cache/**/initial_state_*.json
+js_reverse_cache/**/ground_truth*.json
 js_reverse_cache/browser_cookies.json
 js_reverse_cache/*.png
 

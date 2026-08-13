@@ -3,8 +3,8 @@
 配置播种 — 生成 config/keywords.json (关键词) + config/cities.json (城市)
 
 数据来源:
-  keywords: 51job-crawler config/51job_city_profiles.json (112 制造词, 去城市名前缀)
-  cities:   js_reverse_cache/data/search_base_data.json data.allCity (智联全城市)
+  keywords: 外部 city profile JSON (112 制造词, 去城市名前缀)
+  cities:   外部 search_base_data.json data.allCity (智联全城市)
 
 用法:
   py tools/seed_config.py [--keyword-src <path>] [--city-src <path>]
@@ -17,11 +17,6 @@ import json
 import os
 from typing import List
 
-# 51job 城市 profile 路径 (桌面项目, 跨盘引用)
-DEFAULT_KEYWORD_SRC = r"external-city-profile.json"
-DEFAULT_CITY_SRC = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "js_reverse_cache", "data", "search_base_data.json")
 OUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config")
 
 # 需要播种的 tier (跳过 L2_region_enhanced: "区域+词" 组合, 剥离后与 L1 重复)
@@ -30,8 +25,8 @@ _SEED_TIERS = ("L1_core", "L3_process_extended", "L4_manufacturing_context")
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="配置播种 (keywords/cities)")
-    ap.add_argument("--keyword-src", default=DEFAULT_KEYWORD_SRC, help="51job profiles 路径")
-    ap.add_argument("--city-src", default=DEFAULT_CITY_SRC, help="智联 search_base_data 路径")
+    ap.add_argument("--keyword-src", required=True, help="外部 city profile JSON 路径")
+    ap.add_argument("--city-src", required=True, help="外部 search_base_data JSON 路径")
     ap.add_argument("--dry-run", action="store_true", help="只打印统计不写文件")
     return ap.parse_args()
 

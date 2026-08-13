@@ -254,11 +254,10 @@ config/keywords.json        关键词宇宙 (48 制造词: 51job 基础 28 + 焊
 config/cities.json          智联城市列表 (370 城市, code+name)
 config/*.local.json         本地敏感配置 (gitignored: db/session/risk/run)
 output/                     导出 CSV / 测试产物
-js_reverse_cache/           逆向素材 (分类: assets/analysis/data/tools/tasks)
-js_reverse_cache/assets/    原始证据素材 (js/html/network 抓包)
+js_reverse_cache/           可公开的逆向分析脚本
 js_reverse_cache/analysis/  分析脚本 (probe 探测 / tdc 逆向)
-js_reverse_cache/data/      数据字典 (search_base_data.json)
-js_reverse_cache/tasks/     任务证据目录 (tdc-001/002, risk-phase0, company-positions)
+js_reverse_cache/tasks/     任务分析脚本 (company-positions 等)
+本地抓包、SSR 快照、设备指纹与会话数据保存在 `output/` 或 `ZHAOPIN_CAPTURE_DIR` 指定目录，均不入 Git。
 docs/                       逆向分析文档 + 架构方案
 ```
 

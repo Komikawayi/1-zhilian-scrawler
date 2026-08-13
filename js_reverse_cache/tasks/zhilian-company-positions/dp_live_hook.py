@@ -13,6 +13,7 @@ import signal
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from DrissionPage import Chromium
 
@@ -24,6 +25,7 @@ DEFAULT_TARGETS = (
     "companyJobList",
 )
 DEFAULT_TAB_HINT = "zhaopin.com/companydetail/"
+SENSITIVE_HEADER_NAMES = {"authorization", "cookie", "set-cookie", "proxy-authorization"}
 
 
 def json_value(value: Any) -> Any:
@@ -54,6 +56,23 @@ def safe_attribute(value: Any, name: str, default: Any = None) -> Any:
         return getattr(value, name)
     except Exception:  # noqa: BLE001
         return default
+
+
+def redacted_headers(headers: Any) -> dict[str, Any] | None:
+    headers = json_value(headers)
+    if not isinstance(headers, dict):
+        return headers
+    return {
+        str(key): "<redacted>" if str(key).lower() in SENSITIVE_HEADER_NAMES else value
+        for key, value in headers.items()
+    }
+
+
+def redacted_url(url: Any) -> Any:
+    if not isinstance(url, str):
+        return url
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 def nested_value(value: Any, *path: str) -> Any:
@@ -91,28 +110,34 @@ def response_summary(body: Any) -> dict[str, Any]:
     }
 
 
-def packet_record(packet: Any, full_body: bool) -> dict[str, Any]:
+def packet_record(packet: Any, full_body: bool, include_sensitive: bool = False) -> dict[str, Any]:
     request = safe_attribute(packet, "request")
     response = safe_attribute(packet, "response")
     body = safe_attribute(response, "body") if response else None
     post_data = safe_attribute(request, "postData") if request else None
     return {
         "method": safe_attribute(packet, "method"),
-        "url": safe_attribute(packet, "url"),
+        "url": safe_attribute(packet, "url") if include_sensitive else redacted_url(safe_attribute(packet, "url")),
         "resource_type": safe_attribute(packet, "resourceType"),
         "request": {
-            "params": json_value(safe_attribute(request, "params")) if request else None,
-            "headers": json_value(safe_attribute(request, "headers")) if request else None,
-            "cookies": json_value(safe_attribute(request, "cookies", [])) if request else None,
-            "postData": parse_post_data(post_data),
+            "params": json_value(safe_attribute(request, "params")) if include_sensitive and request else None,
+            "headers": (
+                json_value(safe_attribute(request, "headers"))
+                if include_sensitive else redacted_headers(safe_attribute(request, "headers"))
+            ) if request else None,
+            "cookies": json_value(safe_attribute(request, "cookies", [])) if include_sensitive and request else [],
+            "postData": parse_post_data(post_data) if include_sensitive else None,
         },
         "response": {
             "status": safe_attribute(response, "status") if response else None,
             "status_text": safe_attribute(response, "statusText") if response else None,
             "mime_type": safe_attribute(response, "mimeType") if response else None,
-            "headers": json_value(safe_attribute(response, "headers")) if response else None,
+            "headers": (
+                json_value(safe_attribute(response, "headers"))
+                if include_sensitive else redacted_headers(safe_attribute(response, "headers"))
+            ) if response else None,
             "summary": response_summary(body),
-            **({"body": json_value(body)} if full_body else {}),
+            **({"body": json_value(body)} if full_body and include_sensitive else {}),
         },
     }
 
@@ -131,7 +156,8 @@ def main() -> int:
     parser.add_argument("--port", default="9222", help="existing DP browser port/address (default: 9222)")
     parser.add_argument("--tab-id", help="attach a specific existing tab id instead of latest_tab")
     parser.add_argument("--target", action="append", dest="targets", help="additional URL substring to capture")
-    parser.add_argument("--full-body", action="store_true", help="print complete response bodies")
+    parser.add_argument("--full-body", action="store_true", help="include response bodies with --include-sensitive")
+    parser.add_argument("--include-sensitive", action="store_true", help="include raw URLs, cookies, auth headers, request bodies, and responses")
     parser.add_argument("--all", action="store_true", help="capture all network requests instead of only targets")
     parser.add_argument("--out", type=Path, help="also append records as JSONL")
     args = parser.parse_args()
@@ -169,11 +195,11 @@ def main() -> int:
             for item in packets:
                 if not item:
                     continue
-                record = packet_record(item, args.full_body)
+                record = packet_record(item, args.full_body, args.include_sensitive)
                 print("\n=== packet ===")
                 print(json.dumps(record, ensure_ascii=False, indent=2, default=str))
                 if output:
-                    output.write(json.dumps(packet_record(item, True), ensure_ascii=False, default=str) + "\n")
+                    output.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
                     output.flush()
                 sys.stdout.flush()
     finally:

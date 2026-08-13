@@ -24,13 +24,11 @@ GET sou.zhaopin.com/?kw={公司名}&p=1..N   (不带 jl = 全国)
 | `POST cgate/positionbusiness/searchrecommend/searchPositionsCompany` | statusCode=200 但 data 空（即使浏览器真实会话 + 精确参数）|
 | 公司名搜索 `sou.zhaopin.com/?kw=公司名` | ✅ 全量命中，纯协议无挑战 |
 
-## 证据文件
+## 证据范围
 
-- `initial_state_CZL1425835260.json` — 公司岗位页 SSR 完整 `__INITIAL_STATE__`（onlinePositions 结构）
-- `initial_state_CZL1425835260_htm.json` — 公司详情页（.htm）SSR（在线职位 tab 结构）
-- `ground_truth_sample.json` — cgate searchPositionsCompany 请求/响应样本（data 空 的复现证据）
-- `dp_live_packets*.jsonl` — DrissionPage 抓包原始流（cgate 全部请求全景）
-- `dp_live_hook.py` — XHR hook 脚本（定位前端真实调用点）
+仓库仅保留可复现脚本和结论；原始抓包、SSR 快照和浏览器会话数据仅在本地使用，不提交公开仓库。
+
+- `dp_live_hook.py` — 默认脱敏的被动监听脚本
 - `probe_cgate_search.py` — cgate 接口参数探测（S_SOU_* 参数族）
 - `dp_ssr_and_paging.py` — SSR 分页结构探测（?p=N 翻页 + pages 字段）
 

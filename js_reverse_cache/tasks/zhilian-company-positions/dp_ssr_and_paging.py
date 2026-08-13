@@ -9,12 +9,12 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 
 from DrissionPage import Chromium
 
 COMPANY_URL = "https://www.zhaopin.com/companydetail/CZL1425835260.htm"
-# 输出到本任务目录 (初始态证据归位 tasks/zhilian-company-positions/)
-OUT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUT_DIR = Path(os.environ.get("ZHAOPIN_CAPTURE_DIR", "output"))
 
 
 def safe_wait(tab, count, timeout):
@@ -28,6 +28,7 @@ def safe_wait(tab, count, timeout):
 
 
 def main():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     browser = Chromium()
     tab = browser.latest_tab
     tab.set.window.max()
@@ -41,7 +42,7 @@ def main():
     if m:
         try:
             st = json.loads(m.group(1))
-            with open(os.path.join(OUT_DIR, "initial_state_CZL1425835260_htm.json"), "w", encoding="utf-8") as f:
+            with open(OUT_DIR / "initial_state_CZL1425835260_htm.json", "w", encoding="utf-8") as f:
                 json.dump(st, f, ensure_ascii=False, indent=1)
             op = st.get("onlinePositions") or []
             print("SSR: searchPositionsCount=", st.get("searchPositionsCount"),
