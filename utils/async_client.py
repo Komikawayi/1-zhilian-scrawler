@@ -19,6 +19,7 @@ import random
 import time
 import uuid
 from typing import Optional
+from urllib.parse import quote
 
 from curl_cffi import requests as cffi_requests
 from curl_cffi.const import CurlInfo
@@ -137,6 +138,9 @@ class AsyncZhilianClient:
         self.session = cffi_requests.AsyncSession(
             impersonate=impersonate, max_clients=self.max_clients,
             curl_infos=_NET_INFOS)
+        # AsyncSession 共用 cookie jar。搜索页的两跳导航必须串行，否则另一个任务
+        # 写入的路由 cookie 会令当前页重定向至不含页码的 /jobs。
+        self._search_navigation_lock = asyncio.Lock()
 
     async def get(self, url: str, **kw) -> cffi_requests.Response:
         return await self._request("get", url, **kw)
@@ -193,6 +197,33 @@ class AsyncZhilianClient:
         if flush is not None:
             await flush()
         await self.session.close()
+
+    async def fetch_search_page(self, city: str, keyword: str, page: int) -> str:
+        """获取指定 SSR 搜索页，并阻止路由 cookie 将页码重置为第 1 页。"""
+        query = quote(keyword)
+        entry_url = (f"https://sou.zhaopin.com/?jl={city}&kw={query}&p={page}"
+                     if city != "0" else f"https://sou.zhaopin.com/?kw={query}&p={page}")
+        async with self._search_navigation_lock:
+            redirect = await self.get(entry_url, allow_redirects=False)
+            if redirect.status_code not in (301, 302, 303, 307, 308):
+                raise ConnectionError(f"搜索入口 HTTP {redirect.status_code}")
+            seo_url = redirect.headers.get("location")
+            if not seo_url:
+                raise ConnectionError("搜索入口缺少跳转地址")
+            self.session.cookies.clear()
+            response = await self.get(seo_url, allow_redirects=False)
+
+        if response.status_code != 200:
+            raise ConnectionError(f"搜索页 HTTP {response.status_code}")
+        text = response.text
+        if "Security Verification" in text:
+            await self.report_captcha()
+            raise ConnectionError("EdgeOne 拦截 (验证码)")
+        if "__INITIAL_STATE__" not in text:
+            await self.report_challenge()
+            raise ConnectionError("响应缺少 __INITIAL_STATE__")
+        await self.report_success()
+        return text
 
 
 # ---- 异步 fe-api 详情抓取 (路线一, 镜像 utils/fe_api.py 逻辑) ----

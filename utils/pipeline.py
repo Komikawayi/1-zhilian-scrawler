@@ -137,21 +137,9 @@ class Pipeline:
             await asyncio.sleep(0.2)
 
     async def _search_page(self, client: AsyncZhilianClient, kw: str, city: str, page: int) -> str:
-        """搜索页 (镜像 utils/http_client.fetch_search_page 逻辑, async)。"""
-        url = f"https://sou.zhaopin.com/?jl={city}&kw={kw}&p={page}"
+        """搜索页（指定页码，防止入口 cookie 将其重定向回第 1 页）。"""
         async with self._search_sem:
-            resp = await client.get(url, allow_redirects=True)
-        if resp.status_code != 200:
-            raise ConnectionError(f"HTTP {resp.status_code}")
-        text = resp.text
-        if "Security Verification" in text:
-            await client.report_captcha()
-            raise ConnectionError("EdgeOne 拦截 (Security Verification)")
-        if "__INITIAL_STATE__" not in text:
-            await client.report_challenge()
-            raise ConnectionError("响应缺少 __INITIAL_STATE__")
-        await client.report_success()
-        return text
+            return await client.fetch_search_page(city, kw, page)
 
     # ---- 详情消费者 ----
 

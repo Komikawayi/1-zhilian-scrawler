@@ -138,8 +138,10 @@ class ZhilianClient:
         """
         抓取搜索页 SSR HTML。
 
-        sou.zhaopin.com 会 302 重定向到 www.zhaopin.com/sou/jl{kw编码}/p{page}，
-        kw 编码在服务端完成，客户端无需自行实现。
+        ``sou.zhaopin.com`` 负责把关键词编码成 SEO 地址。其跳转响应会设置一个
+        路由 cookie；若带着该 cookie 请求 SEO 地址，服务端会再跳到不含页码的
+        ``/jobs``，导致所有翻页退回第 1 页。因此跳转后清空 cookie，再请求 SEO
+        地址，并且不跟随意外的二次跳转。
 
         Returns:
             SSR HTML 文本
@@ -147,11 +149,21 @@ class ZhilianClient:
         url = f"https://sou.zhaopin.com/?jl={city}&kw={keyword}&p={page}"
         last_err: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
-            self._throttle()
             try:
-                resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+                self._throttle()
+                redirect = self.session.get(url, timeout=self.timeout, allow_redirects=False)
+                if redirect.status_code not in (301, 302, 303, 307, 308):
+                    raise ConnectionError(f"搜索入口 HTTP {redirect.status_code}")
+                seo_url = redirect.headers.get("location")
+                if not seo_url:
+                    raise ConnectionError("搜索入口缺少跳转地址")
+
+                # 入口设置的 cookie 会把 /sou/.../pN 重定向为 /jobs（页码丢失）。
+                self.session.cookies.clear()
+                self._throttle()
+                resp = self.session.get(seo_url, timeout=self.timeout, allow_redirects=False)
                 if resp.status_code != 200:
-                    raise ConnectionError(f"HTTP {resp.status_code}")
+                    raise ConnectionError(f"搜索页 HTTP {resp.status_code}")
                 text = resp.text
                 if "Security Verification" in text:
                     self.report_captcha()
@@ -161,7 +173,8 @@ class ZhilianClient:
                     self.report_challenge()
                     raise ConnectionError("响应缺少 __INITIAL_STATE__")
                 self.report_success()
-                logger.debug("kw=%s city=%s page=%d -> %s (len=%d)", keyword, city, page, resp.url, len(text))
+                logger.debug("kw=%s city=%s page=%d -> %s (len=%d)",
+                             keyword, city, page, resp.url, len(text))
                 return text
             except Exception as e:  # noqa: BLE001
                 last_err = e

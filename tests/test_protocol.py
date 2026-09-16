@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.http_client import ZhilianClient  # noqa: E402
-from utils.parser import extract_initial_state, parse_positions, parse_meta  # noqa: E402
+from utils.parser import extract_initial_state, parse_positions  # noqa: E402
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,17 +21,19 @@ class TestProtocol(unittest.TestCase):
         html = client.fetch_search_page("python", "530", 1)
         state = extract_initial_state(html)
         rows = parse_positions(state)
-        meta = parse_meta(state)
         self.assertGreater(len(rows), 0)
-        self.assertEqual(meta["page_index"], 1)
-        self.assertGreaterEqual(meta["position_count"], len(rows))
+        self.assertEqual(state["pageIndex"], 1)
 
     def test_pagination_differs(self):
         client = ZhilianClient(min_interval=0.3, max_interval=0.6)
         h1 = client.fetch_search_page("python", "530", 1)
         h2 = client.fetch_search_page("python", "530", 2)
-        n1 = [r["position_number"] for r in parse_positions(extract_initial_state(h1))]
-        n2 = [r["position_number"] for r in parse_positions(extract_initial_state(h2))]
+        s1 = extract_initial_state(h1)
+        s2 = extract_initial_state(h2)
+        self.assertEqual(s1["pageIndex"], 1)
+        self.assertEqual(s2["pageIndex"], 2)
+        n1 = [r["position_number"] for r in parse_positions(s1)]
+        n2 = [r["position_number"] for r in parse_positions(s2)]
         self.assertNotEqual(n1, n2, "两页职位不应完全相同")
 
 

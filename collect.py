@@ -33,7 +33,6 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Dict
-from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -274,25 +273,8 @@ class WorkerConfig:
 # ---- 搜索任务消费 (keyword:/company:) ----
 
 async def _search_page_async(client, city, kw, page) -> str:
-    """搜索页 (sou SSR); city='0' 或不带 = 全国。
-
-    kw 中文 (公司名/关键词) 必须 URL 编码, curl_cffi 不自动编码手拼 query。
-    """
-    q = quote(kw)
-    url = f"https://sou.zhaopin.com/?jl={city}&kw={q}&p={page}" if city != "0" else \
-          f"https://sou.zhaopin.com/?kw={q}&p={page}"
-    resp = await client.get(url, allow_redirects=True)
-    if resp.status_code != 200:
-        raise ConnectionError(f"HTTP {resp.status_code}")
-    text = resp.text
-    if "Security Verification" in text:
-        await client.report_captcha()
-        raise ConnectionError("EdgeOne 拦截 (验证码)")
-    if "__INITIAL_STATE__" not in text:
-        await client.report_challenge()
-        raise ConnectionError("缺 __INITIAL_STATE__")
-    await client.report_success()
-    return text
+    """搜索页 (sou SSR); city='0' 或不带 = 全国。"""
+    return await client.fetch_search_page(city, kw, page)
 
 
 async def _consume_keyword_task(queue, client, storage, pos_queue, task_id: str,
